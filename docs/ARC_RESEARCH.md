@@ -176,6 +176,29 @@ These notes drive the design decisions in `ARCHITECTURE.md`.
   for reads and simulation, `SEND_RPC_URLS` = gateway + Blockdaemon (fan-out, same nonce). Host in
   US-East. A self-run follow node only helps reads, never submission.
 
+## RPC budget facts (measured on 2026-09-16, single IP)
+
+- Every keyless endpoint now returns revert `data` on `eth_call` and supports state overrides.
+  `eth_call` gas is clamped to 30M on the gateway, dRPC, thirdweb and publicnode (arc-node default
+  `--rpc.gascap`), 50M on Blockdaemon and NodeFlare. The 16,777,216 per-transaction cap applies to
+  sent transactions only.
+- Official gateway (`rpc.mainnet.arc.io`; the QuickNode public host is the same software with a
+  **separate** rate bucket): `eth_call` clean up to ~40 rps, 429s at 60 rps; `eth_getLogs` has its own
+  tiny bucket (2 rps clean, 20% errors at 5 rps) with a sustained penalty after heavy use. Large JSON-RPC
+  batches are accepted but individual entries inside them get `-32005`.
+- Blockdaemon (raw reth): 0 errors at 200 rps `eth_call`, batch cap 100 entries, only ~33 hours of log
+  history (never use it for backfills). NodeFlare `rpc.nodeflare.app/arc/public`: full archive, batch cap
+  100, 256 KB body cap. Allnodes `arc-rpc.publicnode.com`: reth, batch cap 100.
+- dRPC free (`rpc.drpc.mainnet.arc.io`): 200 rps `eth_call`, at most 3 requests per JSON-RPC batch,
+  2 s per-request timeout; the only keyless source of `debug_traceCall` / `eth_simulateV1`.
+  `arc.drpc.org` (public tier) and keyless thirdweb rate-limit almost immediately.
+- Multicall3 `aggregate3` of 1,000 `extsload` calls: 0.6–0.8 s on the gateway, 1.5–2.7 s on Blockdaemon.
+  Pack reads (and quoter probes) into `aggregate3` rather than JSON-RPC batches.
+- Gateway replicas can differ by 2–5 blocks within a second: always read with explicit block numbers,
+  never `latest`, and prefer the block's own logs/receipts over re-reading storage.
+- Every WebSocket is intermittently dropped without a close frame after 2–3 minutes: reconnect on
+  ~3 s of silence (the bot's `WS_STALL_MS` watchdog does this).
+
 ## RPC endpoints
 
 | Endpoint | Notes |
