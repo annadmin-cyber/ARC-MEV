@@ -154,6 +154,28 @@ These notes drive the design decisions in `ARCHITECTURE.md`.
 - EURC `0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1`, USYC `0x8a5D989Bbb96929F689B0200f435f53dA42bF490`.
 - CCTP v2 TokenMessengerV2 `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d` (domain 26) for bridging USDC in.
 
+## Latency map and the inclusion window (measured from a US-East sandbox through a proxy)
+
+| Endpoint | Read RTT (med) | Send RTT | `newHeads` |
+|---|---|---|---|
+| official gateway `rpc.mainnet.arc.io` (Cloudflare, same backend as QuickNode's public host) | 94 ms | 87 ms, rate-limited at ~1 send/s sustained, ~6 per burst | `wss://rpc.mainnet.arc.io/ws` first to deliver 87% of blocks |
+| Blockdaemon (raw reth, Frankfurt origin) | 143 ms | 125 ms, no limit seen | 100–130 ms behind the gateway |
+| dRPC (proxy) | 75 ms | 273 ms | 70–100 ms behind |
+
+- **The gateway's HTTP read path lags its own WebSocket by ~300 ms median.** An `eth_call` on the
+  gateway right after `newHeads(N)` often returns N-1 state. Blockdaemon and dRPC show N on the first
+  poll 70–90% of the time. Read state from the block's logs, or from a non-gateway endpoint.
+- Reaction budget: roughly 150–200 ms from `newHeads(N)` to having the signed transaction on the wire to
+  land in N+1 (the next proposer snapshots its pool when the 500 ms height timer fires). About 10% of
+  heights have an almost-zero window (interval p10 ≈ 380 ms). A miss lands in N+2.
+- Equal tips are FIFO at the proposer's pool (arrival after gossip). Incumbent bots land in N+1 for
+  ~68% of their wins; 14–18% of top-slot transactions revert.
+- Consensus parameters are live on chain in `ProtocolConfig` `0x3600…0001` (`consensusParams()`):
+  timeoutPropose 3000 ms, prevote/precommit 1000 ms, targetBlockTime 500 ms.
+- Recommended layout: `WS_URL=wss://rpc.mainnet.arc.io/ws` for heads, `RPC_URL` on Blockdaemon or dRPC
+  for reads and simulation, `SEND_RPC_URLS` = gateway + Blockdaemon (fan-out, same nonce). Host in
+  US-East. A self-run follow node only helps reads, never submission.
+
 ## RPC endpoints
 
 | Endpoint | Notes |
