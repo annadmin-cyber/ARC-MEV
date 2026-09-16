@@ -24,7 +24,11 @@ Read this before touching `src/`. It fixes interfaces so modules built in parall
   load (~10 req/s sustained triggers it). All RPC helpers must retry with exponential backoff on 429
   and on `-32005`/"limit" style errors, and must cap concurrency (default 4).
 - `eth_getLogs` with `toBlock: "latest"` can fail with "block range extends beyond current head";
-  always pass an explicit block number.
+  always pass an explicit block number. A second cap applies: at most 20,000 logs per response
+  (JSON-RPC -32602 "query exceeds max results 20000, retry with the range a-b"), so dense Swap-log
+  queries must bisect. Rate limiting also arrives as HTTP 200 with JSON-RPC error -32005
+  "rate limit exceeded", not only as HTTP 429. Querying a block the node does not have yet returns
+  -32014 (getLogs) or -32001 "block not found" (eth_call).
 - No public mempool: `txpool_*`, pending filters and `newPendingTransactions` are refused. `newHeads`
   works over WebSocket on provider endpoints. `eth_getBlockByNumber("pending")` is refused, so nonce
   management must use the `latest` tag plus a local counter.

@@ -59,6 +59,8 @@ const schema = z.object({
   START_CURRENCIES: z
     .string()
     .default('0x0000000000000000000000000000000000000000:18,0x3600000000000000000000000000000000000000:6'),
+  /** Refetch every tracked pool from scratch every N blocks (safety net for missed logs). */
+  FULL_REFRESH_BLOCKS: z.coerce.number().int().min(1).default(200),
   /** How many tick-bitmap words on each side of the current tick to fetch per pool. */
   TICK_WORDS_EACH_SIDE: z.coerce.number().int().min(1).default(2),
   /** HTTP polling interval (ms) when no WS_URL is configured. */

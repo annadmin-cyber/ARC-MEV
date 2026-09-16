@@ -35,6 +35,8 @@ export interface PoolState {
   /** Packed protocol fee (uint24) as stored in slot0. */
   protocolFee: number
   liquidity: bigint
+  /** Pool tick spacing (copied from PoolInfo); bitmap word boundaries depend on it. */
+  tickSpacing: number
   /** Initialised ticks known around the current tick, sorted ascending. */
   ticks: Map<number, TickData>
   /** Lowest / highest tick for which `ticks` is complete. Beyond this window the simulator stops. */
