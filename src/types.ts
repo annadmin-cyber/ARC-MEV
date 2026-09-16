@@ -140,7 +140,9 @@ export type Simulator = (state: PoolState, zeroForOne: boolean, amountIn: bigint
 
 /** Per-pool guard sent with a transaction: revert cheaply if the pool moved since simulation.
  *  kind 0: poolId = v4 pool id, expected = sqrtPriceX96. kind 1: poolId = v3 pool address (left-padded),
- *  expected = slot0 sqrtPriceX96. kind 2: poolId = v2 pair address (left-padded), expected = reserve0. */
+ *  expected = slot0 sqrtPriceX96. kind 2: poolId = v2 pair address (left-padded), expected = the pair price as
+ *  sqrtPriceX96 = isqrt(reserve1 * 2^192 / reserve0) (what `PoolState.sqrtPriceX96` holds for v2 pairs and the
+ *  contract's `v2SqrtPriceX96` recomputes). */
 export interface StateGuard {
   kind: PoolKind
   poolId: Hex

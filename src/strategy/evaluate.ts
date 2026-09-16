@@ -29,6 +29,8 @@ export interface EvaluatedOpportunity extends Opportunity {
   truncated: boolean
   /** Distinct inputs evaluated by the optimizer. */
   evaluations: number
+  /** True when the hooked hop was priced through the on-chain V4Quoter (see `probe.ts`). */
+  probed?: boolean
 }
 
 const Q96 = 2 ** 96

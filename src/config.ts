@@ -21,6 +21,10 @@ const schema = z.object({
   RPC_URL: z.string().url().default('https://rpc.mainnet.arc.io'),
   /** Optional WebSocket endpoint for newHeads; falls back to HTTP polling when absent. */
   WS_URL: z.string().url().optional(),
+  /** Extra WebSocket endpoints (comma-separated) whose `newHeads` race with `WS_URL`; heads are de-duplicated by number. */
+  WS_URLS: z.string().default(''),
+  /** No head over WebSocket for this many ms -> fall back to HTTP polling until heads resume. */
+  WS_STALL_MS: z.coerce.number().int().min(100).default(3000),
   /** Bot hot key. Only needed when DRY_RUN=false. */
   PRIVATE_KEY: hex.optional(),
   /** Deployed ArcArbExecutor. Only needed for on-chain simulation and sending. */
@@ -51,8 +55,10 @@ const schema = z.object({
    *  uses ~250-350k gas; keep this close to reality or good opportunities are rejected early. */
   QUOTE_GAS: z.coerce.number().int().min(21_000).default(400_000),
 
-  /** Only pools whose liquidity is at least this are tracked. */
-  MIN_POOL_LIQUIDITY: bigintStr('1000000000000'),
+  /** Only pools whose liquidity is at least this are tracked. `L` scales with sqrt(units0 * units1), so a
+   *  pool between an 8-decimal and a 6-decimal token (cirBTC/USDC: L ~ 4e11 for $10M) needs a much lower
+   *  bar than an 18-decimal pair; v2 pairs store isqrt(reserve0 * reserve1). Default 1e8. */
+  MIN_POOL_LIQUIDITY: bigintStr('100000000'),
   /** Max number of pools to refresh per block. */
   MAX_TRACKED_POOLS: z.coerce.number().int().default(300),
   /** Comma-separated hook addresses that are allowed. Empty = only hookless pools. */
@@ -68,6 +74,24 @@ const schema = z.object({
   TICK_WORDS_EACH_SIDE: z.coerce.number().int().min(1).default(2),
   /** HTTP polling interval (ms) when no WS_URL is configured. */
   POLL_INTERVAL_MS: z.coerce.number().int().default(250),
+
+  /** Probe hooked v4 pools (which cannot be simulated locally) through the V4Quoter each block. */
+  PROBE_HOOKED_POOLS: bool('true'),
+  /** At most this many (hooked pool, tracked pool) pairs are quoted per block, most-spread first. */
+  PROBE_MAX_PER_BLOCK: z.coerce.number().int().min(0).default(4),
+  /** A hooked pool is probed only when its spot price differs from a tracked pool's by more than this (bps). */
+  PROBE_MIN_SPREAD_BPS: z.coerce.number().int().min(0).default(30),
+  /** Log-spaced input amounts quoted per probed cycle (one JSON-RPC batch); a refinement pass follows. */
+  PROBE_GRID: z.coerce.number().int().min(2).default(5),
+
+  /** After this many consecutive reverted or lost transactions, stop sending for BREAKER_PAUSE_BLOCKS. */
+  MAX_CONSECUTIVE_REVERTS: z.coerce.number().int().min(1).default(3),
+  /** Blocks the circuit breaker keeps sending paused. */
+  BREAKER_PAUSE_BLOCKS: z.coerce.number().int().min(1).default(120),
+  /** Gas (USDC wei, 18 decimals) the bot may spend per GAS_BUDGET_WINDOW_BLOCKS; beyond it, only dry-runs. Default 5 USDC. */
+  GAS_BUDGET_USDC_WEI: bigintStr('5000000000000000000'),
+  /** Rolling window (blocks, ~1 h at 500 ms) over which GAS_BUDGET_USDC_WEI applies. */
+  GAS_BUDGET_WINDOW_BLOCKS: z.coerce.number().int().min(1).default(7200),
   /** Directory for persisted pool data. */
   DATA_DIR: z.string().default('data'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
@@ -78,6 +102,8 @@ export type Config = z.infer<typeof schema> & {
   /** Lower-cased start currency -> decimals. */
   startCurrencies: Map<Address, number>
   sendRpcUrls: string[]
+  /** Every WebSocket endpoint to subscribe to (`WS_URL` first, then `WS_URLS`), de-duplicated; empty = poll. */
+  wsUrls: string[]
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -105,9 +131,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const sendRpcUrls = [parsed.RPC_URL, ...parsed.SEND_RPC_URLS.split(',').map((s) => s.trim()).filter(Boolean)]
   sendRpcUrls.splice(0, sendRpcUrls.length, ...new Set(sendRpcUrls))
+  const wsUrls = [
+    ...new Set([...(parsed.WS_URL ? [parsed.WS_URL] : []), ...parsed.WS_URLS.split(',').map((s) => s.trim()).filter(Boolean)]),
+  ]
+  for (const url of wsUrls) {
+    if (!/^wss?:\/\//.test(url)) throw new Error(`WS_URLS: expected a ws:// or wss:// URL, got "${url}"`)
+  }
   if (!parsed.DRY_RUN) {
     if (!parsed.PRIVATE_KEY) throw new Error('PRIVATE_KEY is required when DRY_RUN=false')
     if (!parsed.EXECUTOR_ADDRESS) throw new Error('EXECUTOR_ADDRESS is required when DRY_RUN=false')
   }
-  return { ...parsed, allowedHooks, startCurrencies, sendRpcUrls }
+  return { ...parsed, allowedHooks, startCurrencies, sendRpcUrls, wsUrls }
 }

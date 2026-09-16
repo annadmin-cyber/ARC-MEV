@@ -1,5 +1,5 @@
 import { ResponseBodyTooLargeError, formatLog, toEventSelector, toHex, type AbiEvent, type Address, type Hex, type Log, type PublicClient, type RpcLog } from 'viem'
-import { limiter, withRetry, type Limiter } from './client.js'
+import { limiter, withRetry, type Limiter, type RetryOptions } from './client.js'
 
 /** Hard cap the public Arc RPC enforces on one `eth_getLogs` block range. */
 export const MAX_LOG_RANGE = 10_000
@@ -14,9 +14,13 @@ const RESULT_CAP_MESSAGE = /max results|too many results|exceeds max|query retur
 /** Topic filter entry as accepted by `eth_getLogs`: a single topic, any-of list, or wildcard. */
 export type TopicFilter = Hex | Hex[] | null
 
+/** Emitter filter for `eth_getLogs`: one address, several (any of), or none (every contract). */
+export type AddressFilter = Address | readonly Address[] | undefined
+
 /** Parameters for {@link getLogsChunked}. */
 export interface GetLogsChunkedParams {
-  address: Address
+  /** Emitter(s) to match. Omit to match every contract (route by `log.address` afterwards). */
+  address?: AddressFilter
   /** Events to match on topic0 (any of). Ignored when `topics` is given. */
   events?: readonly AbiEvent[]
   /** Raw topic filter (positional). Takes precedence over `events`. */
@@ -42,6 +46,7 @@ export type RawLog = Log<bigint, number, false>
 export async function getLogsChunked(client: PublicClient, params: GetLogsChunkedParams): Promise<RawLog[]> {
   const { address, fromBlock, toBlock } = params
   if (toBlock < fromBlock) return []
+  if (typeof address === 'object' && address.length === 0) return []
   const chunk = BigInt(Math.min(params.chunk ?? MAX_LOG_RANGE, MAX_LOG_RANGE))
   if (chunk < 1n) throw new Error('getLogsChunked: chunk must be >= 1')
   const limit: Limiter = limiter(params.concurrency ?? 3)
@@ -64,7 +69,7 @@ export async function getLogsChunked(client: PublicClient, params: GetLogsChunke
  */
 async function fetchRangeBisecting(
   client: PublicClient,
-  address: Address,
+  address: AddressFilter,
   topics: TopicFilter[],
   from: bigint,
   to: bigint,
@@ -114,13 +119,16 @@ export function eventsToTopics(events: readonly AbiEvent[]): TopicFilter[] {
 /**
  * One `eth_getLogs` call (with retry) for a range that already respects the provider cap. Uses
  * the raw request so that positional topic filters can be passed without viem's event decoding.
+ * `address` may be one emitter, a list of emitters (any of) or `undefined` for no emitter filter.
+ * `retry` overrides the default backoff (callers on a per-block critical path pass a shorter one).
  */
 export async function fetchLogsOnce(
   client: PublicClient,
-  address: Address,
+  address: AddressFilter,
   topics: TopicFilter[],
   fromBlock: bigint,
   toBlock: bigint,
+  retry: RetryOptions = {},
 ): Promise<RawLog[]> {
   if (toBlock - fromBlock + 1n > BigInt(MAX_LOG_RANGE)) {
     throw new Error(`fetchLogsOnce: range ${fromBlock}-${toBlock} exceeds ${MAX_LOG_RANGE} blocks`)
@@ -131,14 +139,14 @@ export async function fetchLogsOnce(
         method: 'eth_getLogs',
         params: [
           {
-            address,
+            ...(address === undefined ? {} : { address: typeof address === 'string' ? address : [...address] }),
             fromBlock: toHex(fromBlock),
             toBlock: toHex(toBlock),
             ...(topics.length > 0 ? { topics } : {}),
           },
         ],
       }),
-    { label: `eth_getLogs ${fromBlock}-${toBlock}` },
+    { label: `eth_getLogs ${fromBlock}-${toBlock}`, ...retry },
   )
   const logs = (raw as RpcLog[]).map((l) => formatLog(l) as RawLog)
   logs.sort(compareLogs)

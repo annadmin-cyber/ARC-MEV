@@ -16,12 +16,20 @@ export type StoredPool = PoolInfo & {
   swapCount?: number
 }
 
+/** Resume point of one v3/v2 factory scan (keyed by `VenueFactory.name` in `store.venues`). */
+export interface VenueScanState {
+  /** Last block whose PoolCreated / PairCreated logs were scanned (inclusive). 0 = never scanned. */
+  lastScannedBlock: number
+}
+
 /** Persisted discovery state for one chain. */
 export interface PoolStore {
   chainId: number
-  /** Last block whose Initialize logs were scanned (inclusive). 0 = never scanned. */
+  /** Last block whose PoolManager Initialize logs were scanned (inclusive). 0 = never scanned. */
   lastScannedBlock: number
   pools: Record<Hex, StoredPool>
+  /** Per-venue (v3/v2 factory) resume points; a venue absent here has never been scanned. */
+  venues: Record<string, VenueScanState>
 }
 
 const hex = z.string().refine((s): s is Hex => isHex(s), 'invalid hex')
@@ -32,9 +40,13 @@ const storedPoolSchema = z.object({
   currency0: address,
   currency1: address,
   fee: z.number().int().nonnegative(),
-  tickSpacing: z.number().int().positive(),
+  /** v2-style pairs have tick spacing 0. */
+  tickSpacing: z.number().int().nonnegative(),
   hooks: address,
   block: z.number().int().nonnegative(),
+  kind: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
+  pool: address.optional(),
+  venue: z.string().optional(),
   liquidity: z.string().regex(/^\d+$/).optional(),
   lastSwapBlock: z.number().int().nonnegative().optional(),
   swapCount: z.number().int().nonnegative().optional(),
@@ -44,6 +56,8 @@ const poolStoreSchema = z.object({
   chainId: z.number().int(),
   lastScannedBlock: z.number().int().nonnegative(),
   pools: z.record(z.string(), storedPoolSchema),
+  /** Absent in stage-1 files: every venue then resumes from its factory's deploy block. */
+  venues: z.record(z.string(), z.object({ lastScannedBlock: z.number().int().nonnegative() })).default({}),
 })
 
 /** Path of the store file: `<DATA_DIR>/pools.<chainId>.json`. */
@@ -53,7 +67,7 @@ export function poolStorePath(cfg: Pick<Config, 'DATA_DIR' | 'CHAIN_ID'>): strin
 
 /** A store with nothing scanned yet. */
 export function emptyPoolStore(chainId: number): PoolStore {
-  return { chainId, lastScannedBlock: 0, pools: {} }
+  return { chainId, lastScannedBlock: 0, pools: {}, venues: {} }
 }
 
 /**
@@ -90,9 +104,10 @@ function normalise(store: PoolStore): PoolStore {
       currency0: p.currency0.toLowerCase() as StoredPool['currency0'],
       currency1: p.currency1.toLowerCase() as StoredPool['currency1'],
       hooks: p.hooks.toLowerCase() as StoredPool['hooks'],
+      ...(p.pool === undefined ? {} : { pool: p.pool.toLowerCase() as NonNullable<StoredPool['pool']> }),
     }
   }
-  return { chainId: store.chainId, lastScannedBlock: store.lastScannedBlock, pools }
+  return { chainId: store.chainId, lastScannedBlock: store.lastScannedBlock, pools, venues: { ...store.venues } }
 }
 
 /**

@@ -1,3 +1,5 @@
 export * from './slots.js'
 export * from './reader.js'
 export * from './cache.js'
+export * from './v3.js'
+export * from './v2.js'

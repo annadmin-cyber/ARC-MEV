@@ -7,9 +7,11 @@
  * fee spike over the next block, and reports the resulting gas cost and the net profit after a
  * safety margin so the caller can decide whether the opportunity is still worth taking.
  */
-import type { PublicClient } from 'viem'
+import { hexToBigInt, isHex, type Hex, type PublicClient } from 'viem'
 import type { Config } from '../config.js'
-import { withRetry, type RpcClients } from '../rpc/client.js'
+import { log } from '../logger.js'
+import { sleep, withRetry, type RpcClients } from '../rpc/client.js'
+import { isBlockNotReady } from '../state/cache.js'
 
 /** The fee parameters chosen for one transaction and what they imply for its economics. */
 export interface FeeQuote {
@@ -94,6 +96,61 @@ export async function readBaseFee(clients: Pick<RpcClients, 'http'>): Promise<{ 
     throw new Error(`readBaseFee: block ${block.number} has no baseFeePerGas`)
   }
   return { baseFee: block.baseFeePerGas, block: block.number }
+}
+
+/** What {@link readNextBaseFee} learned from a block header. */
+export interface NextBaseFee {
+  /** Base fee the *next* block will charge (what a transaction sent now pays). */
+  nextBaseFee: bigint
+  /** Base fee of the header itself. */
+  baseFee: bigint
+  /** Number of the header read. */
+  block: bigint
+  /** `extraData` when the header carried the 8-byte announcement, `fallback` for the +12.5% estimate. */
+  source: 'extraData' | 'fallback'
+}
+
+/** Attempts made when the node has not served `block` yet (-32001 / -32014). */
+const HEADER_NOT_READY_TRIES = 8
+const HEADER_NOT_READY_WAIT_MS = 50
+
+/**
+ * Parse the next block's base fee out of a header. On Arc the proposer publishes it in
+ * `extraData` as an 8-byte big-endian integer (verified on every block sampled); any other
+ * `extraData` length means the announcement is absent and the EIP-1559 worst case
+ * `baseFeePerGas * 1125 / 1000` is used instead.
+ */
+export function parseNextBaseFee(header: { number: bigint; baseFeePerGas: bigint | null | undefined; extraData: Hex | undefined }): NextBaseFee {
+  const baseFee = header.baseFeePerGas
+  if (baseFee === null || baseFee === undefined) throw new Error(`parseNextBaseFee: block ${header.number} has no baseFeePerGas`)
+  const extra = header.extraData
+  if (extra !== undefined && isHex(extra) && extra.length === 2 + 16) {
+    return { nextBaseFee: hexToBigInt(extra), baseFee, block: header.number, source: 'extraData' }
+  }
+  return { nextBaseFee: (baseFee * 1125n) / 1000n, baseFee, block: header.number, source: 'fallback' }
+}
+
+/**
+ * Read the header of `block` (or the latest when omitted) and derive the next block's base fee
+ * with {@link parseNextBaseFee}. Retries briefly while the node answers "block not found" for a
+ * block it will serve within milliseconds (heads arrive before every node has indexed them).
+ */
+export async function readNextBaseFee(clients: Pick<RpcClients, 'http'>, block?: bigint): Promise<NextBaseFee> {
+  const label = block === undefined ? 'eth_getBlockByNumber(latest)' : `eth_getBlockByNumber(${block})`
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const header = await withRetry(
+        () => (block === undefined ? clients.http.getBlock({ blockTag: 'latest', includeTransactions: false }) : clients.http.getBlock({ blockNumber: block, includeTransactions: false })),
+        { label },
+      )
+      const parsed = parseNextBaseFee(header)
+      if (parsed.source === 'fallback') log.debug({ block: header.number, extraData: header.extraData }, 'header extraData is not an 8-byte base fee, using +12.5% estimate')
+      return parsed
+    } catch (error) {
+      if (attempt >= HEADER_NOT_READY_TRIES || !isBlockNotReady(error)) throw error
+      await sleep(HEADER_NOT_READY_WAIT_MS)
+    }
+  }
 }
 
 /**

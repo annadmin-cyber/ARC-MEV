@@ -1,22 +1,27 @@
 /**
- * Bot entry point: load config and pools, build the cycle set, warm the state cache at the
- * latest block, then follow the chain head (WebSocket `newHeads` when `WS_URL` is set, HTTP
- * polling otherwise) and hand every new block to {@link ArbBot}. `DRY_RUN=true` (the default)
- * runs the whole pipeline but only logs what it would send. SIGINT / SIGTERM stop the loop after
- * the block in progress.
+ * Bot entry point: load config and pools, build the cycle set and the hooked-pool probe set,
+ * warm the state cache at the latest block, then follow the chain head (`newHeads` over every
+ * configured WebSocket endpoint with a stall watchdog, HTTP polling otherwise) and hand every
+ * new block to {@link ArbBot}. `DRY_RUN=true` (the default) runs the whole pipeline but only
+ * logs what it would send. SIGINT / SIGTERM stop the loop after the block in progress.
  */
 import { stat } from 'node:fs/promises'
+import { createPublicClient, webSocket, type PublicClient } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import type { Hex } from 'viem'
 import { loadConfig, type Config } from './config.js'
 import { loadPoolStore, poolStorePath, selectTrackedPools, type PoolStore } from './discovery/index.js'
 import { ArbBot } from './exec/bot.js'
 import { BlockLoop } from './exec/blockLoop.js'
+import { startHeadSource, type HeadSubscription } from './exec/headSource.js'
 import { groupCycles } from './exec/pipeline.js'
+import { probeIoFor, probeSettingsFor } from './exec/probeIo.js'
 import { Sender } from './exec/sender.js'
 import { log } from './logger.js'
 import { makeClients, withRetry, type RpcClients } from './rpc/client.js'
 import { isBlockNotReady, StateCache } from './state/cache.js'
-import { buildCycles } from './strategy/index.js'
+import { buildCycles, HookedProbe, selectProbePools } from './strategy/index.js'
+import type { PoolInfo } from './types.js'
 
 /** A pool store older than this is reported as stale at startup. */
 const STORE_STALE_MS = 2 * 60 * 60 * 1000
@@ -25,7 +30,7 @@ async function main(): Promise<void> {
   const cfg = loadConfig()
   const clients = makeClients(cfg)
   log.info(
-    { chainId: cfg.CHAIN_ID, rpc: cfg.RPC_URL, ws: cfg.WS_URL ?? null, dryRun: cfg.DRY_RUN, executor: cfg.EXECUTOR_ADDRESS ?? null },
+    { chainId: cfg.CHAIN_ID, rpc: cfg.RPC_URL, ws: cfg.wsUrls, dryRun: cfg.DRY_RUN, executor: cfg.EXECUTOR_ADDRESS ?? null, probe: cfg.PROBE_HOOKED_POOLS },
     'starting',
   )
 
@@ -46,14 +51,21 @@ async function main(): Promise<void> {
   const initBlock = await initCache(clients, cache)
   log.info({ block: initBlock }, 'state cache initialised')
 
+  const probe = cfg.PROBE_HOOKED_POOLS ? await makeProbe(clients, cfg, store, tracked, infos, initBlock) : undefined
   const sender = cfg.DRY_RUN ? undefined : makeSender(clients, cfg)
-  const bot = new ArbBot({ clients, cfg, cache, infos, groups, ...(sender ? { sender } : {}) })
+  const bot = new ArbBot({ clients, cfg, cache, infos, groups, ...(sender ? { sender } : {}), ...(probe ? { probe } : {}) })
   const loop = new BlockLoop((block, skipped) => bot.processBlock(block, skipped))
-  const stopSource = startBlockSource(clients, cfg, (b) => loop.notify(b))
+  const source = startHeadSource({
+    subscriptions: wsSubscriptions(clients, cfg),
+    poll: () => withRetry(() => clients.http.getBlockNumber({ cacheTime: 0 }), { label: 'eth_blockNumber', tries: 2 }),
+    pollIntervalMs: cfg.POLL_INTERVAL_MS,
+    stallMs: cfg.WS_STALL_MS,
+    onBlock: (b) => loop.notify(b),
+  })
 
   const shutdown = async (signal: string): Promise<void> => {
-    log.info({ signal }, 'shutting down after the current block')
-    stopSource()
+    log.info({ signal, head: source.status() }, 'shutting down after the current block')
+    source.stop()
     await loop.stop()
     log.info({ lastBlock: loop.lastProcessed }, 'stopped')
     await exitAfterFlush(0)
@@ -110,51 +122,42 @@ function makeSender(clients: RpcClients, cfg: Config): Sender {
 }
 
 /**
- * Feed new block numbers to `onBlock`: `newHeads` over WebSocket when a `ws` client exists
- * (falling back to polling if the subscription errors), otherwise `eth_blockNumber` polling every
- * `POLL_INTERVAL_MS`. Returns a function that stops the source.
+ * One `newHeads` subscription per configured WebSocket endpoint (`WS_URL` reuses the client
+ * `makeClients` built; the extra `WS_URLS` get their own). Empty when none is configured.
  */
-function startBlockSource(clients: RpcClients, cfg: Config, onBlock: (block: bigint) => void): () => void {
-  let stopped = false
-  let stopPolling: (() => void) | undefined
-  const poll = (): void => {
-    if (stopped || stopPolling) return
-    log.info({ intervalMs: cfg.POLL_INTERVAL_MS }, 'following the head by polling eth_blockNumber')
-    let busy = false
-    const timer = setInterval(() => {
-      if (busy) return
-      busy = true
-      clients.http
-        .getBlockNumber({ cacheTime: 0 })
-        .then(onBlock)
-        .catch((error: unknown) => log.warn({ err: error }, 'eth_blockNumber failed'))
-        .finally(() => (busy = false))
-    }, cfg.POLL_INTERVAL_MS)
-    stopPolling = () => clearInterval(timer)
-  }
-  if (!clients.ws) {
-    poll()
-    return () => {
-      stopped = true
-      stopPolling?.()
+function wsSubscriptions(clients: RpcClients, cfg: Config): HeadSubscription[] {
+  return cfg.wsUrls.map((url) => {
+    const client: PublicClient =
+      url === cfg.WS_URL && clients.ws
+        ? clients.ws
+        : (createPublicClient({ chain: clients.chain, transport: webSocket(url, { retryCount: 0, timeout: 20_000 }) }) as PublicClient)
+    return {
+      url,
+      watch: (onBlock, onError) => client.watchBlockNumber({ emitMissed: false, emitOnBegin: true, onBlockNumber: onBlock, onError }),
     }
-  }
-  log.info({ ws: cfg.WS_URL }, 'following the head via newHeads')
-  const unwatch = clients.ws.watchBlockNumber({
-    emitMissed: false,
-    emitOnBegin: true,
-    onBlockNumber: onBlock,
-    onError: (error) => {
-      log.warn({ err: error }, 'newHeads subscription failed, falling back to polling')
-      unwatch()
-      poll()
-    },
   })
-  return () => {
-    stopped = true
-    unwatch()
-    stopPolling?.()
+}
+
+/**
+ * Build the hooked-pool probe over the store's most active hooked pools that share a pair with a
+ * tracked pool, seeded with their `slot0` at `block`; `undefined` when there is nothing to probe.
+ */
+async function makeProbe(
+  clients: RpcClients,
+  cfg: Config,
+  store: PoolStore,
+  tracked: readonly PoolInfo[],
+  infos: Map<Hex, PoolInfo>,
+  block: bigint,
+): Promise<HookedProbe | undefined> {
+  const pools = selectProbePools(Object.values(store.pools), tracked, new Set(cfg.startCurrencies.keys()))
+  if (pools.length === 0) {
+    log.info('probe: no hooked pools share a pair with a tracked pool; probing disabled')
+    return undefined
   }
+  const probe = new HookedProbe(probeSettingsFor(cfg), probeIoFor(clients, cfg), infos, pools, cfg.startCurrencies)
+  await probe.init(block)
+  return probe
 }
 
 main().catch((error: unknown) => {

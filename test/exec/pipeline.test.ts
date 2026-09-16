@@ -10,6 +10,7 @@ import {
   groupCycles,
   pickBest,
   planFor,
+  poolTag,
   quoteCandidates,
   TX_GAS_CAP,
   withHeadroom,
@@ -17,7 +18,7 @@ import {
   type SimulatedCandidate,
 } from '../../src/exec/pipeline.js'
 import { NATIVE, type Cycle } from '../../src/types.js'
-import { CYCLE, EXECUTOR, INFOS, P1, P2, STATES, testConfig } from './helpers.js'
+import { CYCLE, EXECUTOR, INFOS, MIXED_CYCLE, MIXED_INFOS, P1, P2, P3, P4, STATES, testConfig } from './helpers.js'
 
 const GWEI = 1_000_000_000n
 const USDC_ERC20: Address = '0x3600000000000000000000000000000000000000'
@@ -140,9 +141,18 @@ describe('formatting', () => {
     expect(feePercent(10000)).toBe('1%')
     expect(feePercent(0x800000)).toBe('dyn')
     // Fixture pool ids are 0x000…0a1 / 0x000…0a2, so their first 8 hex digits are zeros.
-    expect(describeCycle(CYCLE, INFOS)).toBe('native -[00000000 0.3%]-> 0xc8c2…3e22 -[00000000 1%]-> native')
+    // P2 is hooked, so its hop carries the `hook` venue tag.
+    expect(describeCycle(CYCLE, INFOS)).toBe('native -[00000000 0.3%]-> 0xc8c2…3e22 -[00000000 hook 1%]-> native')
     expect(describeCycle(CYCLE, new Map())).toBe('native -[00000000 ?]-> ? -[00000000 ?]-> ?')
     const realId = { ...CYCLE, hops: [{ poolId: '0xba2b9bdf04fd659448a44ac6cabc27f8565bcdf00f58028ec9a07ccf31286514' as const, zeroForOne: true }] }
     expect(describeCycle(realId, new Map())).toBe('native -[ba2b9bdf ?]-> ?')
+    // v3 / v2 hops are tagged by their contract address (their pool id is the zero-padded address).
+    expect(poolTag(P3.poolId, P3)).toBe('82916bee')
+    expect(poolTag(P4.poolId, P4)).toBe('5dbf5881')
+    expect(poolTag(P1.poolId, P1)).toBe('00000000')
+    expect(poolTag(P3.poolId)).toBe('00000000')
+    expect(describeCycle(MIXED_CYCLE, MIXED_INFOS)).toBe(
+      'native -[00000000 0.3%]-> 0xc8c2…3e22 -[82916bee v3:uniswap-v3 0.05%]-> 0xd1d1…d1d1 -[5dbf5881 v2:uniswap-v2 0.3%]-> native',
+    )
   })
 })

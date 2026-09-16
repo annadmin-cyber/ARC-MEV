@@ -38,3 +38,25 @@ export {
   type EvaluatedOpportunity,
 } from './evaluate.js'
 export { rankOpportunities, to18, from18 } from './rank.js'
+export {
+  HookedProbe,
+  selectProbePools,
+  encodeQuoteExactInput,
+  decodeQuote,
+  logGrid,
+  spotPrice,
+  spreadBps,
+  type InputBounds,
+  type PrefetchedLogs,
+  type ProbeCandidate,
+  type ProbeCycle,
+  type ProbeIo,
+  type ProbePrice,
+  type ProbeResult,
+  type ProbeSettings,
+  type ProbedOpportunity,
+  type QuoteCall,
+  type QuoteCaller,
+  type QuoteOutcome,
+  type Slot0Snapshot,
+} from './probe.js'

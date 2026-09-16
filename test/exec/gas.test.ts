@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { feePolicy, median, mulRatio } from '../../src/exec/gas.js'
-import { testConfig } from './helpers.js'
+import { createPublicClient, custom, type PublicClient } from 'viem'
+import { feePolicy, median, mulRatio, parseNextBaseFee, readNextBaseFee } from '../../src/exec/gas.js'
+import { formatFixed } from '../../src/exec/pipeline.js'
+import { rpcHeader, testConfig } from './helpers.js'
 
 const GWEI = 1_000_000_000n
 const USDC = 10n ** 18n
@@ -83,5 +85,46 @@ describe('helpers', () => {
     expect(median([5n])).toBe(5n)
     expect(median([9n, 1n, 5n])).toBe(5n)
     expect(median([4n, 1n, 3n, 2n])).toBe(2n)
+  })
+})
+
+describe('readNextBaseFee', () => {
+  /** Header fields of an Arc mainnet block whose extraData announces the next base fee (130.86 gwei). */
+  const ARC_HEADER = { number: 21_112_099n, baseFeePerGas: 121_598_711_914n, extraData: '0x0000001e78249c77' as const }
+
+  it('parses the 8-byte big-endian extraData as the next base fee', () => {
+    const parsed = parseNextBaseFee(ARC_HEADER)
+    expect(parsed).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData' })
+    expect(formatFixed(parsed.nextBaseFee, 9, 2)).toBe('130.86')
+  })
+
+  it('falls back to baseFee * 1125 / 1000 when extraData is not exactly 8 bytes', () => {
+    expect(parseNextBaseFee({ ...ARC_HEADER, extraData: '0x' })).toMatchObject({ nextBaseFee: 136_798_550_903n, source: 'fallback' })
+    expect(parseNextBaseFee({ ...ARC_HEADER, extraData: '0x0000001e78249c7700' })).toMatchObject({ source: 'fallback' })
+    expect(parseNextBaseFee({ ...ARC_HEADER, extraData: undefined })).toMatchObject({ source: 'fallback' })
+    expect(() => parseNextBaseFee({ ...ARC_HEADER, baseFeePerGas: null })).toThrow(/baseFeePerGas/)
+  })
+
+  it('reads the header of the given block and retries while the node has not served it', async () => {
+    let attempts = 0
+    const calls: unknown[] = []
+    const client = createPublicClient({
+      transport: custom(
+        {
+          request: async ({ method, params }: { method: string; params: unknown[] }) => {
+            calls.push([method, params])
+            if (method !== 'eth_getBlockByNumber') throw new Error(`unexpected ${method}`)
+            attempts++
+            if (attempts < 3) throw { code: -32001, message: 'block not found' }
+            return rpcHeader(21_112_099n, '0x0000001e78249c77')
+          },
+        },
+        { retryCount: 0 },
+      ),
+    }) as PublicClient
+    const fee = await readNextBaseFee({ http: client }, 21_112_099n)
+    expect(fee).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData' })
+    expect(attempts).toBe(3)
+    expect(calls[0]).toEqual(['eth_getBlockByNumber', ['0x1422523', false]])
   })
 })

@@ -7,10 +7,10 @@
 import { formatUnits, type Address, type Hex } from 'viem'
 import type { Config } from '../config.js'
 import { log } from '../logger.js'
-import { simulateExactInput } from '../math/simulate.js'
+import { makeSimulator } from '../math/hop.js'
 import type { RpcClients } from '../rpc/client.js'
-import { cyclesTouching, evaluateAll, from18, rankOpportunities, to18, type EvaluatedOpportunity } from '../strategy/index.js'
-import { NATIVE, type Cycle, type ExecutorStep, type PoolInfo, type PoolState, type StateGuard } from '../types.js'
+import { cyclesTouching, evaluateAll, from18, rankOpportunities, to18, type EvaluatedOpportunity, type InputBounds } from '../strategy/index.js'
+import { NATIVE, poolKind, type Cycle, type ExecutorStep, type PoolInfo, type PoolState, type StateGuard } from '../types.js'
 import { encodeExecute, guardsForConfig, toExecutorSteps } from './encode.js'
 import { feePolicy, type FeeQuote } from './gas.js'
 import type { PreparedTx } from './sender.js'
@@ -34,11 +34,25 @@ export interface CycleGroup {
 }
 
 /**
- * Group `cycles` by start currency and derive the optimiser bounds: `maxInput` is
- * `MAX_INPUT_USDC_WEI` scaled from 18 decimals to the currency's, and `minInput` is
- * `MIN_PROFIT_USDC_WEI` scaled the same way (an input smaller than the minimum profit cannot
- * plausibly earn it), never below 1. Cycles whose start currency has no configured decimals are
- * dropped with a warning.
+ * Optimiser input bounds for a start currency with `decimals`: `maxInput` is `MAX_INPUT_USDC_WEI`
+ * scaled from 18 decimals to the currency's, and `minInput` is `MIN_PROFIT_USDC_WEI` scaled the
+ * same way (an input smaller than the minimum profit cannot plausibly earn it), never below 1.
+ */
+export function inputBoundsFor(cfg: Pick<Config, 'MIN_PROFIT_USDC_WEI' | 'MAX_INPUT_USDC_WEI'>, decimals: number): InputBounds {
+  const minInput = from18(cfg.MIN_PROFIT_USDC_WEI, decimals)
+  return { minInput: minInput < 1n ? 1n : minInput, maxInput: from18(cfg.MAX_INPUT_USDC_WEI, decimals) }
+}
+
+/** {@link inputBoundsFor} for every configured start currency, keyed by (lower-cased) address. */
+export function boundsByStart(cfg: Pick<Config, 'startCurrencies' | 'MIN_PROFIT_USDC_WEI' | 'MAX_INPUT_USDC_WEI'>): Map<Address, InputBounds> {
+  const out = new Map<Address, InputBounds>()
+  for (const [start, decimals] of cfg.startCurrencies) out.set(start, inputBoundsFor(cfg, decimals))
+  return out
+}
+
+/**
+ * Group `cycles` by start currency with the optimiser bounds of {@link inputBoundsFor}. Cycles
+ * whose start currency has no configured decimals are dropped with a warning.
  */
 export function groupCycles(
   cfg: Pick<Config, 'startCurrencies' | 'MIN_PROFIT_USDC_WEI' | 'MAX_INPUT_USDC_WEI'>,
@@ -58,23 +72,16 @@ export function groupCycles(
       log.warn({ start, cycles: list.length }, 'dropping cycles: start currency has no configured decimals')
       continue
     }
-    const minInput = from18(cfg.MIN_PROFIT_USDC_WEI, decimals)
-    groups.push({
-      start,
-      decimals,
-      cycles: list,
-      index: cyclesTouching(list),
-      minInput: minInput < 1n ? 1n : minInput,
-      maxInput: from18(cfg.MAX_INPUT_USDC_WEI, decimals),
-    })
+    groups.push({ start, decimals, cycles: list, index: cyclesTouching(list), ...inputBoundsFor(cfg, decimals) })
   }
   return groups
 }
 
 /**
- * Evaluate every group against `states` with the exact local simulator and return the ranked
- * opportunities (USDC-normalised, best first, at most one per pool). With `touched`, only cycles
- * through a touched pool are evaluated.
+ * Evaluate every group against `states` with the exact local simulator (dispatching on each
+ * pool's kind: v4 / v3 tick walk, v2 constant product) and return the ranked opportunities
+ * (USDC-normalised, best first, at most one per pool). With `touched`, only cycles through a
+ * touched pool are evaluated.
  */
 export function evaluateGroups(
   cfg: Pick<Config, 'startCurrencies'>,
@@ -85,8 +92,9 @@ export function evaluateGroups(
   touched?: Set<Hex>,
 ): EvaluatedOpportunity[] {
   const all: EvaluatedOpportunity[] = []
+  const simulate = makeSimulator(infos)
   for (const group of groups) {
-    const opps = evaluateAll(group.cycles, states, infos, simulateExactInput, {
+    const opps = evaluateAll(group.cycles, states, infos, simulate, {
       minInput: group.minInput,
       maxInput: group.maxInput,
       block: Number(block),
@@ -151,7 +159,7 @@ export async function simulateCandidates(
       let guards: StateGuard[]
       try {
         steps = toExecutorSteps(candidate.opp.cycle, infos)
-        guards = guardsForConfig(cfg, candidate.opp.cycle, states)
+        guards = guardsForConfig(cfg, candidate.opp.cycle, states, infos)
       } catch (error) {
         return { candidate, steps: [], guards: [], result: { ok: false, reason: `encode: ${(error as Error).message}` } }
       }
@@ -271,16 +279,41 @@ export function currencyLabel(currency: Address): string {
   return `${c.slice(0, 6)}…${c.slice(-4)}`
 }
 
-/** One-line description of a cycle: `native -[ba2b9bdf 3%]-> 0xc8c2…3e22 -[27effa63 1%]-> native`. */
+/**
+ * Short venue tag for a pool: empty for a hookless v4 pool, `hook` for a hooked v4 pool,
+ * `v3`/`v2` (with `:<venue>` when discovery recorded the factory name) for the other kinds.
+ */
+export function venueLabel(info: Pick<PoolInfo, 'kind' | 'hooks' | 'venue'>): string {
+  const kind = poolKind(info)
+  if (kind === 0) return info.hooks.toLowerCase() === NATIVE ? '' : 'hook'
+  const base = kind === 1 ? 'v3' : 'v2'
+  return info.venue ? `${base}:${info.venue}` : base
+}
+
+/**
+ * One-line description of a cycle with each hop's pool tag ({@link poolTag}), venue tag and fee:
+ * `native -[ba2b9bdf 3%]-> 0xc8c2…3e22 -[82916bee v3:uniswap-v3 0.01%]-> native`.
+ */
 export function describeCycle(cycle: Cycle, infos: ReadonlyMap<Hex, PoolInfo>): string {
   let text = currencyLabel(cycle.start.toLowerCase() as Address)
   for (const hop of cycle.hops) {
     const info = infos.get(hop.poolId)
     const next = info === undefined ? undefined : hop.zeroForOne ? info.currency1 : info.currency0
     const fee = info === undefined ? '?' : feePercent(info.fee)
-    text += ` -[${hop.poolId.slice(2, 10)} ${fee}]-> ${next === undefined ? '?' : currencyLabel(next)}`
+    const venue = info === undefined ? '' : venueLabel(info)
+    text += ` -[${poolTag(hop.poolId, info)}${venue ? ` ${venue}` : ''} ${fee}]-> ${next === undefined ? '?' : currencyLabel(next)}`
   }
   return text
+}
+
+/**
+ * Eight hex digits identifying a pool in logs: the first eight of a v4 pool id, or of the contract
+ * address of a v3/v2 pool (whose pool id is the address left-padded with zeros, which would print
+ * as `00000000`).
+ */
+export function poolTag(poolId: Hex, info?: Pick<PoolInfo, 'kind' | 'pool'>): string {
+  const address = info && poolKind(info) !== 0 ? info.pool : undefined
+  return (address ?? poolId).slice(2, 10)
 }
 
 /** `3000` -> `"0.3%"`, `0x800000` -> `"dyn"`. */
