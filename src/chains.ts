@@ -41,6 +41,16 @@ export const CHAINS: Record<number, Chain> = {
   [arcTestnet.id]: arcTestnet,
 }
 
+/** A concentrated-liquidity (v3-style) or constant-product (v2-style) factory to index. */
+export interface VenueFactory {
+  name: string
+  address: `0x${string}`
+  /** Block the factory was deployed in (discovery starts here). */
+  deployBlock: number
+  /** Default swap fee in pips for v2-style pairs (ignored for v3-style, whose pools expose fee()). */
+  feePips?: number
+}
+
 /** Well-known addresses per chain (lower-case). Mainnet entries verified by eth_getCode on 2026-09-16. */
 export const ADDRESSES: Record<number, {
   poolManager: `0x${string}`
@@ -51,11 +61,14 @@ export const ADDRESSES: Record<number, {
   stateView?: `0x${string}`
   v4Quoter?: `0x${string}`
   universalRouter?: `0x${string}`
-  /** Uniswap-v3-style factory with active pools (operator unknown). */
-  v3Factory?: `0x${string}`
-  /** WarpDex v2-style factory. */
-  v2Factory?: `0x${string}`
+  /** Uniswap v3 QuoterV2 (for v3-style pools). */
+  v3QuoterV2?: `0x${string}`
+  /** Uniswap-v3-style factories (canonical `PoolCreated` event, pools with `slot0()`/`swap()`+callback). */
+  v3Factories: VenueFactory[]
+  /** Uniswap-v2-style factories (`PairCreated` event, pairs with `getReserves()`/`swap()`). */
+  v2Factories: VenueFactory[]
   eurc?: `0x${string}`
+  cirBtc?: `0x${string}`
 }> = {
   [arc.id]: {
     poolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951',
@@ -64,14 +77,27 @@ export const ADDRESSES: Record<number, {
     stateView: '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b',
     v4Quoter: '0x8dc178efb8111bb0973dd9d722ebeff267c98f94',
     universalRouter: '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1',
-    v3Factory: '0xf0db7b58379503491d857db50ac9ece64c653918',
-    v2Factory: '0x32330c2400a6e0830d56661169ebb6c147e3577a',
+    v3QuoterV2: '0x7dfd4f31be6814d2906bde155c3e1b146eac1468',
+    v3Factories: [
+      // Official Uniswap v3 on Arc (16k pools; the deepest pool on Arc, cirBTC/USDC 0.01%, lives here).
+      { name: 'uniswap-v3', address: '0xf0db7b58379503491d857db50ac9ece64c653918', deployBlock: 1_948_019 },
+    ],
+    v2Factories: [
+      // Official Uniswap v2 on Arc (310 pairs, mostly dust).
+      { name: 'uniswap-v2', address: '0x89e5db8b5aa49aa85ac63f691524311aeb649eba', deployBlock: 1_948_019, feePips: 3000 },
+      // DYORSwap v2 fork (48 pairs, a few memecoins with real depth).
+      { name: 'dyorswap', address: '0x942bd5bfdc5317c5507e326f8eb4bb6058ab5c10', deployBlock: 4_130_418, feePips: 3000 },
+    ],
     eurc: '0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1',
+    cirBtc: '0x171a4217b86a807a64eb94757db6849fb4bdbaa0',
   },
   [arcTestnet.id]: {
-    poolManager: '0x0000000000000000000000000000000000000000',
-    poolManagerDeployBlock: 0,
+    // Community PoolManager on testnet; every pool there had zero liquidity on 2026-09-16.
+    poolManager: '0x2756f3f7bfaf103f4c550f4d24cdca82b093240a',
+    poolManagerDeployBlock: 59_094_022,
     usdc: '0x3600000000000000000000000000000000000000',
+    v3Factories: [],
+    v2Factories: [],
   },
 }
 
