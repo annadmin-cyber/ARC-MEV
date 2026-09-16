@@ -13,8 +13,8 @@ export const poolManagerAbi = parseAbi([
 /** ArcArbExecutor (contracts/src/ArcArbExecutor.sol). */
 export const executorAbi = parseAbi([
   'struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }',
-  'struct Step { PoolKey key; bool zeroForOne; }',
-  'struct Guard { bytes32 poolId; uint160 expectedSqrtPriceX96; uint24 toleranceBps; }',
+  'struct Step { uint8 kind; bool zeroForOne; address pool; PoolKey key; }',
+  'struct Guard { uint8 kind; bytes32 poolId; uint160 expected; uint24 toleranceBps; }',
   'function execute(Step[] steps, uint256 amountIn, uint256 minProfit, Guard[] guards) returns (uint256 profit)',
   'function withdraw(address currency, address to, uint256 amount)',
   'function sweep(address currency, address to)',
@@ -31,7 +31,9 @@ export const executorAbi = parseAbi([
   'error NoOutput(uint256 stepIndex)',
   'error CycleNotClosed(address start, address end)',
   'error Unprofitable(int256 delta, uint256 minProfit)',
-  'error StaleState(uint256 guardIndex, uint160 actualSqrtPriceX96)',
+  'error StaleState(uint256 guardIndex, uint160 actual)',
+  'error UnknownKind(uint256 stepIndex)',
+  'error UnexpectedCallback(address caller)',
   'error CallFailed(bytes reason)',
 ])
 

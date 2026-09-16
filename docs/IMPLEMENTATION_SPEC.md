@@ -88,14 +88,23 @@ Tick bitmap: `compressed = floor(tick / tickSpacing)` (floor toward -inf), `word
 
 ```
 struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }
-struct Step   { PoolKey key; bool zeroForOne; }
-struct Guard  { bytes32 poolId; uint160 expectedSqrtPriceX96; uint24 toleranceBps; }
+struct Step   { uint8 kind; bool zeroForOne; address pool; PoolKey key; }   // kind 0 = v4, 1 = v3-style, 2 = v2-style
+struct Guard  { uint8 kind; bytes32 poolId; uint160 expected; uint24 toleranceBps; }
 function execute(Step[] steps, uint256 amountIn, uint256 minProfit, Guard[] guards) returns (uint256 profit)
 ```
 
-`execute` reverts with `StaleState(i, actual)` before any swap if a guarded pool's sqrtPrice moved more
-than `toleranceBps` basis points, and with `Unprofitable(net, minProfit)` after the swaps if the net
-gain is too small. Simulation is a plain `eth_call` of `execute` from the operator address.
+- For every kind `key.currency0/currency1` are the pool's token0/token1 and `zeroForOne` the direction.
+  v4 uses the whole key; v3/v2 use `pool` (and for v2 `key.fee` = pair fee in pips). `hooks`/`tickSpacing`
+  are zero for non-v4 hops.
+- Guards: kind 0 -> `poolId` is the v4 id and `expected` its sqrtPriceX96; kind 1 -> `poolId` is the v3
+  pool address left-padded to 32 bytes and `expected` its slot0 sqrtPriceX96; kind 2 -> v2 pair address,
+  `expected` = reserve0.
+- A cycle may start in native USDC (address(0)) and end in the ERC-20 predeploy (0x3600…) or vice versa;
+  the contract treats them as the same money (they are one balance on Arc) and measures profit in the
+  start currency's units.
+- `execute` reverts with `StaleState(i, actual)` before any swap if a guarded pool moved more than
+  `toleranceBps`, and with `Unprofitable(net, minProfit)` after the swaps if the net gain is too small.
+  Simulation is a plain `eth_call` of `execute` from the operator address.
 
 ## Module contracts
 

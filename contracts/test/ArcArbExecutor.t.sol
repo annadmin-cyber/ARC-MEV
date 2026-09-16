@@ -5,33 +5,38 @@ import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {ArcArbExecutor} from "../src/ArcArbExecutor.sol";
-import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {MockV3Pool} from "./mocks/MockV3Pool.sol";
+import {MockV2Pair} from "./mocks/MockV2Pair.sol";
 
 contract ArcArbExecutorTest is Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    ArcArbExecutor.Guard[] internal NO_GUARDS;
-
     ArcArbExecutor internal exec;
     address internal owner = makeAddr("owner");
     address internal operator = makeAddr("operator");
     address internal stranger = makeAddr("stranger");
 
-    // Two ERC20/ERC20 pools on the same pair with different fee tiers.
+    ArcArbExecutor.Guard[] internal NO_GUARDS;
+
+    // Two ERC20/ERC20 v4 pools on the same pair with different fee tiers.
     PoolKey internal poolA; // 0.30%, tick spacing 60
     PoolKey internal poolB; // 0.05%, tick spacing 10
 
-    // Two native/ERC20 pools (currency0 = address(0), like native USDC on Arc).
+    // Two native/ERC20 v4 pools (currency0 = address(0), like native USDC on Arc).
     PoolKey internal nativeA;
     PoolKey internal nativeB;
+
+    MockERC20 internal t0;
+    MockERC20 internal t1;
 
     ModifyLiquidityParams internal WIDE =
         ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 100e18, salt: 0});
@@ -39,13 +44,14 @@ contract ArcArbExecutorTest is Deployers {
     function setUp() public {
         deployFreshManagerAndRouters();
         (currency0, currency1) = deployMintAndApprove2Currencies();
+        t0 = MockERC20(Currency.unwrap(currency0));
+        t1 = MockERC20(Currency.unwrap(currency1));
 
         (poolA,) = initPool(currency0, currency1, IHooks(address(0)), 3000, 60, SQRT_PRICE_1_1);
         (poolB,) = initPool(currency0, currency1, IHooks(address(0)), 500, 10, SQRT_PRICE_1_1);
         modifyLiquidityRouter.modifyLiquidity(poolA, WIDE, ZERO_BYTES);
         modifyLiquidityRouter.modifyLiquidity(poolB, WIDE, ZERO_BYTES);
 
-        // Native pools: currency0 = native, currency1 = an ERC20.
         vm.deal(address(this), 10_000 ether);
         (nativeA,) = initPool(CurrencyLibrary.ADDRESS_ZERO, currency1, IHooks(address(0)), 3000, 60, SQRT_PRICE_1_1);
         (nativeB,) = initPool(CurrencyLibrary.ADDRESS_ZERO, currency1, IHooks(address(0)), 500, 10, SQRT_PRICE_1_1);
@@ -59,6 +65,23 @@ contract ArcArbExecutorTest is Deployers {
     // helpers
     // ------------------------------------------------------------------
 
+    function _v4(PoolKey memory key, bool zeroForOne) internal pure returns (ArcArbExecutor.Step memory) {
+        return ArcArbExecutor.Step({kind: 0, zeroForOne: zeroForOne, pool: address(0), key: key});
+    }
+
+    function _ext(uint8 kind, address pool, Currency c0, Currency c1, uint24 fee, bool zeroForOne)
+        internal
+        pure
+        returns (ArcArbExecutor.Step memory)
+    {
+        return ArcArbExecutor.Step({
+            kind: kind,
+            zeroForOne: zeroForOne,
+            pool: pool,
+            key: PoolKey({currency0: c0, currency1: c1, fee: fee, tickSpacing: 0, hooks: IHooks(address(0))})
+        });
+    }
+
     /// @dev Push token0 into pool B so token0 becomes cheap there relative to pool A.
     function _skewB() internal {
         swap(poolB, true, -1e18, ZERO_BYTES);
@@ -67,12 +90,26 @@ contract ArcArbExecutorTest is Deployers {
     /// @dev Buy token0 cheap in B (sell token1), sell it in A (get token1 back). Start currency = token1.
     function _arbSteps() internal view returns (ArcArbExecutor.Step[] memory steps) {
         steps = new ArcArbExecutor.Step[](2);
-        steps[0] = ArcArbExecutor.Step({key: poolB, zeroForOne: false});
-        steps[1] = ArcArbExecutor.Step({key: poolA, zeroForOne: true});
+        steps[0] = _v4(poolB, false);
+        steps[1] = _v4(poolA, true);
+    }
+
+    /// @dev A v3-style mock pool where token0 is expensive (few token0, many token1).
+    function _deployV3(uint256 r0, uint256 r1, bytes4 selector) internal returns (MockV3Pool pool) {
+        pool = new MockV3Pool(t0, t1, 3000, selector);
+        t0.transfer(address(pool), r0);
+        t1.transfer(address(pool), r1);
+    }
+
+    function _deployV2(uint256 r0, uint256 r1) internal returns (MockV2Pair pair) {
+        pair = new MockV2Pair(t0, t1, 3000);
+        t0.transfer(address(pair), r0);
+        t1.transfer(address(pair), r1);
+        pair.sync();
     }
 
     // ------------------------------------------------------------------
-    // happy path
+    // v4-only cycles
     // ------------------------------------------------------------------
 
     function test_execute_profitableCycle_erc20() public {
@@ -95,25 +132,20 @@ contract ArcArbExecutorTest is Deployers {
     }
 
     function test_execute_profitableCycle_native() public {
-        // Skew native pool B by selling native into it.
         swapNativeInput(nativeB, true, -1e18, ZERO_BYTES, 1e18);
 
-        // Buy native cheap in B (sell token1 -> native), sell native in A (native -> token1).
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
-        steps[0] = ArcArbExecutor.Step({key: nativeB, zeroForOne: false});
-        steps[1] = ArcArbExecutor.Step({key: nativeA, zeroForOne: true});
+        steps[0] = _v4(nativeB, false);
+        steps[1] = _v4(nativeA, true);
 
         vm.prank(operator);
         uint256 profit = exec.execute(steps, 0.1e18, 1, NO_GUARDS);
         assertGt(profit, 0);
         assertEq(currency1.balanceOf(address(exec)), profit);
 
-        // And the reverse orientation with native as the start currency:
-        // sell native in A (expensive), buy back in B (cheap)... only profitable while skew remains.
-        // After the first arb the gap is smaller but still non-zero because we under-sized the input.
         ArcArbExecutor.Step[] memory steps2 = new ArcArbExecutor.Step[](2);
-        steps2[0] = ArcArbExecutor.Step({key: nativeA, zeroForOne: true});
-        steps2[1] = ArcArbExecutor.Step({key: nativeB, zeroForOne: false});
+        steps2[0] = _v4(nativeA, true);
+        steps2[1] = _v4(nativeB, false);
         vm.prank(operator);
         uint256 nativeProfit = exec.execute(steps2, 0.05e18, 1, NO_GUARDS);
         assertGt(nativeProfit, 0);
@@ -121,7 +153,6 @@ contract ArcArbExecutorTest is Deployers {
     }
 
     function test_execute_threeHopCycle() public {
-        // Third token C with pools C/token0 and C/token1 at 1:1, plus skewed token0/token1 pool.
         MockERC20 c = new MockERC20("C", "C", 18);
         c.mint(address(this), 1_000_000e18);
         c.approve(address(modifyLiquidityRouter), type(uint256).max);
@@ -135,13 +166,12 @@ contract ArcArbExecutorTest is Deployers {
         modifyLiquidityRouter.modifyLiquidity(pC0, WIDE, ZERO_BYTES);
         modifyLiquidityRouter.modifyLiquidity(pC1, WIDE, ZERO_BYTES);
 
-        _skewB(); // token0 cheap in pool B
+        _skewB();
 
-        // Cycle: token1 -> token0 (pool B, cheap), token0 -> C (pC0), C -> token1 (pC1).
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](3);
-        steps[0] = ArcArbExecutor.Step({key: poolB, zeroForOne: false});
-        steps[1] = ArcArbExecutor.Step({key: pC0, zeroForOne: Currency.unwrap(pC0.currency0) == Currency.unwrap(currency0)});
-        steps[2] = ArcArbExecutor.Step({key: pC1, zeroForOne: Currency.unwrap(pC1.currency0) == Currency.unwrap(cc)});
+        steps[0] = _v4(poolB, false);
+        steps[1] = _v4(pC0, Currency.unwrap(pC0.currency0) == Currency.unwrap(currency0));
+        steps[2] = _v4(pC1, Currency.unwrap(pC1.currency0) == Currency.unwrap(cc));
 
         vm.prank(operator);
         uint256 profit = exec.execute(steps, 0.1e18, 1, NO_GUARDS);
@@ -152,11 +182,180 @@ contract ArcArbExecutorTest is Deployers {
     }
 
     // ------------------------------------------------------------------
-    // reverts
+    // cross-venue cycles (v3 / v2 mocks)
+    // ------------------------------------------------------------------
+
+    function test_v4_then_v3_cycle_withForkSelector() public {
+        // token0 expensive on the v3 mock: buy token0 on v4 (1:1), sell it on v3.
+        MockV3Pool v3 = _deployV3(50e18, 100e18, bytes4(keccak256("someForkSwapCallback(int256,int256,bytes)")));
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false); // token1 -> token0 on v4
+        steps[1] = _ext(1, address(v3), currency0, currency1, 3000, true); // token0 -> token1 on v3
+
+        uint256 before = t1.balanceOf(address(exec));
+        vm.prank(operator);
+        uint256 profit = exec.execute(steps, 1e18, 1, NO_GUARDS);
+        assertGt(profit, 0);
+        assertEq(t1.balanceOf(address(exec)) - before, profit, "profit held in wallet");
+        assertEq(t0.balanceOf(address(exec)), 0, "no leftover token0");
+    }
+
+    function test_v3_first_flashLoanFromPoolManager_then_v4() public {
+        // token0 cheap on the v3 mock (many token0, few token1): buy token0 there, sell on v4.
+        MockV3Pool v3 = _deployV3(100e18, 50e18, ArcArbExecutor.uniswapV3SwapCallback.selector);
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _ext(1, address(v3), currency0, currency1, 3000, false); // token1 -> token0 on v3 (flash-borrowed token1)
+        steps[1] = _v4(poolA, true); // token0 -> token1 on v4
+
+        assertEq(t1.balanceOf(address(exec)), 0, "executor starts with nothing");
+        vm.prank(operator);
+        uint256 profit = exec.execute(steps, 1e18, 1, NO_GUARDS);
+        assertGt(profit, 0);
+        assertEq(t1.balanceOf(address(exec)), profit);
+        assertEq(t0.balanceOf(address(exec)), 0);
+    }
+
+    function test_v4_then_v2_cycle() public {
+        MockV2Pair v2 = _deployV2(50e18, 100e18); // token0 expensive on v2
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false); // token1 -> token0 on v4
+        steps[1] = _ext(2, address(v2), currency0, currency1, 3000, true); // token0 -> token1 on v2
+
+        vm.prank(operator);
+        uint256 profit = exec.execute(steps, 1e18, 1, NO_GUARDS);
+        assertGt(profit, 0);
+        assertEq(t1.balanceOf(address(exec)), profit);
+        assertEq(t0.balanceOf(address(exec)), 0);
+    }
+
+    function test_v2_then_v3_noV4Hops_stillWorksViaFlashLoan() public {
+        MockV2Pair v2 = _deployV2(100e18, 50e18); // token0 cheap on v2
+        MockV3Pool v3 = _deployV3(50e18, 100e18, ArcArbExecutor.uniswapV3SwapCallback.selector); // token0 expensive on v3
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _ext(2, address(v2), currency0, currency1, 3000, false); // token1 -> token0 on v2
+        steps[1] = _ext(1, address(v3), currency0, currency1, 3000, true); // token0 -> token1 on v3
+
+        vm.prank(operator);
+        uint256 profit = exec.execute(steps, 1e18, 1, NO_GUARDS);
+        assertGt(profit, 0);
+        assertEq(t1.balanceOf(address(exec)), profit);
+    }
+
+    function test_crossVenue_revertsWhenUnprofitable() public {
+        MockV3Pool v3 = _deployV3(100e18, 100e18, ArcArbExecutor.uniswapV3SwapCallback.selector); // 1:1, only fees
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false);
+        steps[1] = _ext(1, address(v3), currency0, currency1, 3000, true);
+        vm.prank(operator);
+        vm.expectPartialRevert(ArcArbExecutor.Unprofitable.selector);
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+    }
+
+    function test_callback_rejectsUnexpectedCaller() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.UnexpectedCallback.selector, stranger));
+        exec.uniswapV3SwapCallback(1, -1, "");
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.UnexpectedCallback.selector, stranger));
+        (bool ok,) = address(exec).call(abi.encodeWithSignature("pancakeV3SwapCallback(int256,int256,bytes)", 1, -1, ""));
+        ok;
+    }
+
+    function test_unknownKindReverts() public {
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](1);
+        steps[0] = _ext(7, address(0), currency0, currency1, 0, true);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.UnknownKind.selector, 0));
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+    }
+
+    function test_crossVenue_cycleNotClosedWhenEndDiffers() public {
+        MockV3Pool v3 = _deployV3(50e18, 100e18, ArcArbExecutor.uniswapV3SwapCallback.selector);
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(nativeA, true); // native -> token1 on v4
+        steps[1] = _ext(1, address(v3), currency0, currency1, 3000, false); // token1 -> token0 on v3: ends in token0
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.CycleNotClosed.selector, CurrencyLibrary.ADDRESS_ZERO, currency0));
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+    }
+
+    // ------------------------------------------------------------------
+    // guards
+    // ------------------------------------------------------------------
+
+    function test_guards_v4_passWithinTolerance_andRevertWhenStale() public {
+        _skewB();
+        (uint160 priceA,,,) = manager.getSlot0(poolA.toId());
+        (uint160 priceB,,,) = manager.getSlot0(poolB.toId());
+
+        ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](2);
+        guards[0] = ArcArbExecutor.Guard({kind: 0, poolId: PoolId.unwrap(poolA.toId()), expected: priceA, toleranceBps: 0});
+        guards[1] = ArcArbExecutor.Guard({kind: 0, poolId: PoolId.unwrap(poolB.toId()), expected: priceB, toleranceBps: 1});
+
+        uint256 snap = vm.snapshotState();
+        vm.prank(operator);
+        uint256 profit = exec.execute(_arbSteps(), 0.1e18, 1, guards);
+        assertGt(profit, 0);
+        vm.revertToState(snap);
+
+        swap(poolB, false, -0.5e18, ZERO_BYTES);
+        (uint160 movedB,,,) = manager.getSlot0(poolB.toId());
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.StaleState.selector, 1, movedB));
+        exec.execute(_arbSteps(), 0.1e18, 1, guards);
+
+        guards[1].toleranceBps = 10_000;
+        vm.prank(operator);
+        exec.execute(_arbSteps(), 0.01e18, 0, guards);
+    }
+
+    function test_guards_areCheckedBeforeSwaps() public {
+        ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](1);
+        guards[0] = ArcArbExecutor.Guard({kind: 0, poolId: PoolId.unwrap(poolA.toId()), expected: 1, toleranceBps: 0});
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](1);
+        steps[0] = _v4(poolB, false);
+        vm.prank(operator);
+        vm.expectPartialRevert(ArcArbExecutor.StaleState.selector);
+        exec.execute(steps, 0.1e18, 0, guards);
+    }
+
+    function test_guards_v3_and_v2() public {
+        MockV3Pool v3 = _deployV3(50e18, 100e18, ArcArbExecutor.uniswapV3SwapCallback.selector);
+        MockV2Pair v2 = _deployV2(50e18, 100e18);
+        (uint160 v3Price,,,,,,) = v3.slot0();
+        (uint112 r0,,) = v2.getReserves();
+
+        ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](2);
+        guards[0] = ArcArbExecutor.Guard({kind: 1, poolId: bytes32(uint256(uint160(address(v3)))), expected: v3Price, toleranceBps: 0});
+        guards[1] = ArcArbExecutor.Guard({kind: 2, poolId: bytes32(uint256(uint160(address(v2)))), expected: uint160(r0), toleranceBps: 0});
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false);
+        steps[1] = _ext(1, address(v3), currency0, currency1, 3000, true);
+
+        uint256 snap = vm.snapshotState();
+        vm.prank(operator);
+        exec.execute(steps, 0.5e18, 1, guards);
+        vm.revertToState(snap);
+
+        // Move the v2 pair: its guard must trip.
+        t0.transfer(address(v2), 1e18);
+        v2.sync();
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.StaleState.selector, 1, uint160(r0 + 1e18)));
+        exec.execute(steps, 0.5e18, 1, guards);
+    }
+
+    // ------------------------------------------------------------------
+    // reverts / access control
     // ------------------------------------------------------------------
 
     function test_execute_revertsWhenUnprofitable() public {
-        // No skew: any round trip loses the fees.
         vm.prank(operator);
         vm.expectPartialRevert(ArcArbExecutor.Unprofitable.selector);
         exec.execute(_arbSteps(), 0.1e18, 0, NO_GUARDS);
@@ -173,7 +372,6 @@ contract ArcArbExecutorTest is Deployers {
         vm.expectPartialRevert(ArcArbExecutor.Unprofitable.selector);
         exec.execute(_arbSteps(), 0.1e18, profit + 1, NO_GUARDS);
 
-        // Exactly minProfit passes.
         vm.prank(operator);
         assertEq(exec.execute(_arbSteps(), 0.1e18, profit, NO_GUARDS), profit);
     }
@@ -187,8 +385,8 @@ contract ArcArbExecutorTest is Deployers {
 
     function test_execute_revertsOnBrokenPath() public {
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
-        steps[0] = ArcArbExecutor.Step({key: poolB, zeroForOne: false}); // out: token0
-        steps[1] = ArcArbExecutor.Step({key: poolA, zeroForOne: false}); // in: token1 != token0
+        steps[0] = _v4(poolB, false); // out: token0
+        steps[1] = _v4(poolA, false); // in: token1 != token0
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.PathBroken.selector, 1));
         exec.execute(steps, 0.1e18, 0, NO_GUARDS);
@@ -196,49 +394,10 @@ contract ArcArbExecutorTest is Deployers {
 
     function test_execute_revertsWhenCycleNotClosed() public {
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](1);
-        steps[0] = ArcArbExecutor.Step({key: poolB, zeroForOne: false});
+        steps[0] = _v4(poolB, false);
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.CycleNotClosed.selector, currency1, currency0));
         exec.execute(steps, 0.1e18, 0, NO_GUARDS);
-    }
-
-    function test_guards_passWithinTolerance_andRevertWhenStale() public {
-        _skewB();
-        (uint160 priceA,,,) = manager.getSlot0(poolA.toId());
-        (uint160 priceB,,,) = manager.getSlot0(poolB.toId());
-
-        ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](2);
-        guards[0] = ArcArbExecutor.Guard({poolId: PoolId.unwrap(poolA.toId()), expectedSqrtPriceX96: priceA, toleranceBps: 0});
-        guards[1] = ArcArbExecutor.Guard({poolId: PoolId.unwrap(poolB.toId()), expectedSqrtPriceX96: priceB, toleranceBps: 1});
-
-        uint256 snap = vm.snapshotState();
-        vm.prank(operator);
-        uint256 profit = exec.execute(_arbSteps(), 0.1e18, 1, guards);
-        assertGt(profit, 0);
-        vm.revertToState(snap);
-
-        // Someone else moves pool B first: exact guard on A still passes, 1 bp guard on B fails.
-        swap(poolB, false, -0.5e18, ZERO_BYTES);
-        (uint160 movedB,,,) = manager.getSlot0(poolB.toId());
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.StaleState.selector, 1, movedB));
-        exec.execute(_arbSteps(), 0.1e18, 1, guards);
-
-        // A wide tolerance lets it through again.
-        guards[1].toleranceBps = 10_000;
-        vm.prank(operator);
-        exec.execute(_arbSteps(), 0.01e18, 0, guards);
-    }
-
-    function test_guards_areCheckedBeforeAccessToSwaps() public {
-        // A stale guard must revert even for a plan that would otherwise fail later, proving the check runs first.
-        ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](1);
-        guards[0] = ArcArbExecutor.Guard({poolId: PoolId.unwrap(poolA.toId()), expectedSqrtPriceX96: 1, toleranceBps: 0});
-        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](1);
-        steps[0] = ArcArbExecutor.Step({key: poolB, zeroForOne: false});
-        vm.prank(operator);
-        vm.expectPartialRevert(ArcArbExecutor.StaleState.selector);
-        exec.execute(steps, 0.1e18, 0, guards);
     }
 
     function test_execute_onlyOperatorOrOwner() public {
@@ -258,7 +417,7 @@ contract ArcArbExecutorTest is Deployers {
     // ------------------------------------------------------------------
 
     function test_withdraw_erc20_and_native() public {
-        MockERC20(Currency.unwrap(currency1)).transfer(address(exec), 5e18);
+        t1.transfer(address(exec), 5e18);
         vm.deal(address(exec), 3 ether);
 
         vm.startPrank(owner);
@@ -284,15 +443,15 @@ contract ArcArbExecutorTest is Deployers {
     }
 
     function test_call_onlyOwner_andForwards() public {
-        MockERC20(Currency.unwrap(currency1)).transfer(address(exec), 1e18);
+        t1.transfer(address(exec), 1e18);
         bytes memory data = abi.encodeWithSignature("transfer(address,uint256)", owner, 1e18);
 
         vm.prank(operator);
         vm.expectRevert(ArcArbExecutor.NotOwner.selector);
-        exec.call(Currency.unwrap(currency1), 0, data);
+        exec.call(address(t1), 0, data);
 
         vm.prank(owner);
-        exec.call(Currency.unwrap(currency1), 0, data);
+        exec.call(address(t1), 0, data);
         assertEq(currency1.balanceOf(owner), 1e18);
     }
 

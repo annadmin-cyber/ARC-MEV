@@ -85,8 +85,17 @@ export interface Opportunity {
   block: number
 }
 
+/** Pool kinds understood by the executor. 0 = Uniswap v4, 1 = v3-style pool, 2 = v2-style pair. */
+export type PoolKind = 0 | 1 | 2
+
 /** The ABI-encoded shape of `ArcArbExecutor.Step`. */
 export interface ExecutorStep {
+  kind: PoolKind
+  zeroForOne: boolean
+  /** v3/v2 pool address; zero address for v4. */
+  pool: Address
+  /** For every kind currency0/currency1 are the pool's token0/token1. fee/tickSpacing/hooks are v4 fields;
+   *  for v2 `fee` carries the pair fee in pips. */
   key: {
     currency0: Address
     currency1: Address
@@ -94,16 +103,18 @@ export interface ExecutorStep {
     tickSpacing: number
     hooks: Address
   }
-  zeroForOne: boolean
 }
 
 /** Local exact-input swap simulator signature (implemented in math/simulate.ts). */
 export type Simulator = (state: PoolState, zeroForOne: boolean, amountIn: bigint) => SwapResult
 
-/** Per-pool guard sent with a transaction: revert cheaply if the pool moved since simulation. */
+/** Per-pool guard sent with a transaction: revert cheaply if the pool moved since simulation.
+ *  kind 0: poolId = v4 pool id, expected = sqrtPriceX96. kind 1: poolId = v3 pool address (left-padded),
+ *  expected = slot0 sqrtPriceX96. kind 2: poolId = v2 pair address (left-padded), expected = reserve0. */
 export interface StateGuard {
+  kind: PoolKind
   poolId: Hex
-  expectedSqrtPriceX96: bigint
-  /** Allowed deviation in basis points of sqrtPrice (0 = exact). */
+  expected: bigint
+  /** Allowed deviation in basis points (0 = exact). */
   toleranceBps: number
 }
