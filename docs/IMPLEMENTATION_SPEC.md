@@ -270,3 +270,19 @@ Shared types already carry what is needed: `PoolInfo.kind/pool/venue` (`poolKind
   `contracts/test/vectors/ExecCalldataVectors.t.sol`), `readNextBaseFee` parsing (fixture header from
   Arc with `extraData` 0x0000001e78249c77 = 130.86 gwei), probe grid/batching with a fake transport,
   breaker and budget logic, watchdog fallback with fake timers.
+
+#### 2B addendum: which hooked pools to probe (from the hook research)
+
+- Decode hook permissions from the low 14 bits of the hook address
+  (`BEFORE_SWAP = 1<<7`, `AFTER_SWAP = 1<<6`, `BEFORE_SWAP_RETURNS_DELTA = 1<<3`, `AFTER_SWAP_RETURNS_DELTA = 1<<2`).
+- **Exclude** from probing any hook with `BEFORE_SWAP_RETURNS_DELTA` (the launchpad families
+  `…e0cc` = 0x20cc and `…6acc` = 0x2acc): they are one-sided bonding curves; the sell direction reverts
+  with `NotEnoughLiquidity`, so they cannot close a cycle.
+- **Include** hooks with only `BEFORE_SWAP + AFTER_SWAP + AFTER_SWAP_RETURNS_DELTA` (flags 0x5c7 family:
+  the market-maker pools `0x285f3cc5…`, `0x16e40ea8…`, `0x58f2cee5…`, `0x50e4e362…`). They charge ~0 fee
+  today, have no caller restrictions or cooldowns, and are actively arbitraged, but their owners can
+  pause or reconfigure at any time, so quote them fresh every block and never tick-walk them locally.
+- A `V4Quoter` revert wrapping `NotEnoughLiquidity(bytes32)` (`0x6190b2b0` → inner `0x7a5ed734`) means
+  "reduce size", not "pool broken": halve the input and retry within the same probe budget.
+- Budget ~25–45k extra gas per hooked hop when quoting profitability.
+- Optionally read `paused()` (`0x5c975abb`) on a hook once per N blocks and skip paused hooks.

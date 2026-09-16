@@ -84,6 +84,20 @@ These notes drive the design decisions in `ARCHITECTURE.md`.
   Price them only through `V4Quoter.quoteExactInput` (multi-hop in one call) and enforce `minProfit`.
 - `eth_call` without `gasPrice` runs with `BASEFEE = 0` on reth.
 
+## Hooked pools: what the hooks actually do
+
+- The four market-maker hooks (`0x285f3cc5…`, `0x16e40ea8…`, `0x58f2cee5…`, `0x50e4e362…`; flags 0x5c7 =
+  beforeSwap + afterSwap + afterSwapReturnsDelta + after-liquidity hooks, static fee 0) charge
+  essentially zero fee today (1 USDC → 0.865741 EURC vs mid 0.865742), return a zero afterSwap delta,
+  have no caller restrictions, no cooldown, no oracle, and are run by at least three different owners
+  (OZ Ownable + Pausable). Their liquidity is passive (one ModifyLiquidity per 2,000 blocks) and
+  bounded: oversized quotes revert with core `NotEnoughLiquidity` (USDC/EURC ~10–50k USDC, CRCL and
+  cirBTC low thousands). Safe as arb legs if quoted fresh every block through `V4Quoter`.
+- The launchpad hooks (`…e0cc` = flags 0x20cc, `…6acc` = 0x2acc, both with beforeSwapReturnsDelta) are
+  one-sided bonding curves: buying works, selling reverts `NotEnoughLiquidity`. They cannot close a
+  cycle and are excluded.
+- Hooked quotes cost ~62–84k gas versus ~37k for a hookless pool.
+
 ## DEX census (full log scans from the deploy blocks)
 
 | Venue | Where | Size |
