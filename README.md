@@ -66,12 +66,26 @@ npm run bot
    ```
    Note the printed executor address.
 3. **Configure the bot.** In `.env` set `EXECUTOR_ADDRESS`, `PRIVATE_KEY` (the operator key),
-   `WS_URL` (provider WebSocket), optionally `SEND_RPC_URLS` (extra endpoints that also receive
-   your signed transaction), and finally `DRY_RUN=false`.
+   `WS_URL`, `RPC_URL` and `SEND_RPC_URLS` as in the endpoint table below, and finally
+   `DRY_RUN=false`. Start with `MAX_INPUT_USDC_WEI` at a few hundred USDC and the default
+   `GAS_BUDGET_USDC_WEI` (5 USDC per hour) until you have seen a few real receipts.
 4. **Run it.** `npm run bot`. Keep `LOG_LEVEL=info`; use `debug` to see per-block timings.
 5. **Collect profit.** Profit accumulates in the executor. From the owner key:
    `cast send $EXECUTOR "sweep(address,address)" 0x3600000000000000000000000000000000000000 $OWNER`
    (use `0x0000000000000000000000000000000000000000` for native USDC).
+
+## Which endpoints to use
+
+Measured on launch day (details in `docs/ARC_RESEARCH.md`):
+
+| Job | Use | Why |
+|---|---|---|
+| New blocks | `WS_URL=wss://rpc.mainnet.arc.io/ws` | delivered first for 87% of blocks; add Blockdaemon/QuickNode in `WS_URLS` as spares |
+| Reads and simulation (`RPC_URL`) | `https://rpc.blockdaemon.mainnet.arc.io` or `https://rpc.drpc.mainnet.arc.io` | the official gateway's HTTP path lags its own WebSocket by ~300 ms and rate-limits hard; these two return revert data on `eth_call` |
+| Sending (`SEND_RPC_URLS`) | `https://rpc.mainnet.arc.io,https://rpc.blockdaemon.mainnet.arc.io` | fastest send path plus a second route; the gateway allows about one send per second, Blockdaemon showed no limit |
+
+The reaction budget from a new head to having your transaction on the wire is roughly 150–200 ms
+if you want it in the very next block. Host the bot in US-East and keep the tracked pool set small.
 
 ## Configuration
 
