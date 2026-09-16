@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Address, Hex } from 'viem'
-import { compareStoredPools, isEligible, selectTrackedPools } from '../../src/discovery/scan.js'
+import { compareStoredPools, cycleCapablePools, isEligible, selectTrackedPools } from '../../src/discovery/scan.js'
 import { emptyPoolStore, type StoredPool } from '../../src/discovery/store.js'
 
 const A = '0x0000000000000000000000000000000000000000' as Address
@@ -87,5 +87,33 @@ describe('selectTrackedPools', () => {
     for (const p of pools) store.pools[p.poolId] = p
     expect(ids(selectTrackedPools({ ...cfg, MAX_TRACKED_POOLS: 1 }, store))).toEqual([1, 2])
     expect(ids(selectTrackedPools({ ...cfg, MAX_TRACKED_POOLS: 0 }, store))).toEqual([])
+  })
+
+  it('with startCurrencies, spends the cap only on pools that can lie on a cycle', () => {
+    const D = '0x4000000000000000000000000000000000000004' as Address
+    const E = '0x5000000000000000000000000000000000000005' as Address
+    const F = '0x6000000000000000000000000000000000000006' as Address
+    const store = emptyPoolStore(5042)
+    const pools = [
+      pool(1, { currency0: A, currency1: D, liquidity: '9000' }), // A/D unique pair, D is a leaf -> no cycle
+      pool(2, { currency0: A, currency1: E, liquidity: '8000' }), // A/E unique pair, E is a leaf -> no cycle
+      pool(3, { currency0: A, currency1: B, liquidity: '700' }), // 2-hop with 4
+      pool(4, { currency0: A, currency1: B, liquidity: '600' }),
+      pool(5, { currency0: A, currency1: C, liquidity: '500' }), // triangle A-C-B-A with 6 and 3/4
+      pool(6, { currency0: B, currency1: C, liquidity: '400' }), // does not touch A but closes the triangle
+      pool(7, { currency0: C, currency1: F, liquidity: '300' }), // C/F: F is a leaf -> no cycle through A or C
+    ]
+    for (const p of pools) store.pools[p.poolId] = p
+    const capable = cycleCapablePools(pools, new Set([A]))
+    expect([...capable].map((id) => Number(BigInt(id))).sort()).toEqual([3, 4, 5, 6])
+    // Without the option the two most liquid (useless) pools eat the cap of 3.
+    expect(ids(selectTrackedPools(cfg, store))).toEqual([1, 2, 3, 4])
+    // With it the cap goes to cycle-capable pools only, in liquidity order, plus pair completion.
+    expect(ids(selectTrackedPools(cfg, store, { startCurrencies: new Set([A]) }))).toEqual([3, 4, 5])
+    expect(ids(selectTrackedPools({ ...cfg, MAX_TRACKED_POOLS: 4 }, store, { startCurrencies: new Set([A]) }))).toEqual([3, 4, 5, 6])
+    // A start currency that is only a common neighbour still makes a triangle usable.
+    expect([...cycleCapablePools(pools, new Set([C]))].map((id) => Number(BigInt(id))).sort()).toEqual([3, 4, 5, 6])
+    // No start currency in the graph -> nothing is capable.
+    expect(cycleCapablePools(pools, new Set([HOOK])).size).toBe(0)
   })
 })

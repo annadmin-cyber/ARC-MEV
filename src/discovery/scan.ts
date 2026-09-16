@@ -196,25 +196,43 @@ export function pairKey(pool: Pick<PoolInfo, 'currency0' | 'currency1'>): string
   return `${pool.currency0}/${pool.currency1}`
 }
 
+/** Options for {@link selectTrackedPools}. */
+export interface SelectOptions {
+  /**
+   * When given, eligible pools that cannot lie on any 2- or 3-hop cycle through one of these
+   * (lower-cased) currencies are dropped before the cap is applied, so the tracking budget is not
+   * spent on pools the strategy can never use (see {@link cycleCapablePools}).
+   */
+  startCurrencies?: ReadonlySet<Address>
+}
+
 /**
  * Choose the pools the bot tracks each block.
  *
  * 1. Eligible = hooks allowed (none, or in `cfg.allowedHooks`) AND liquidity known AND
  *    liquidity >= `cfg.MIN_POOL_LIQUIDITY`.
- * 2. Sort eligible by {@link compareStoredPools}: `lastSwapBlock` desc (never-swapped last),
+ * 2. With `opts.startCurrencies`, eligible is narrowed to {@link cycleCapablePools}: pools that
+ *    can be part of some 2- or 3-hop cycle through a start currency among the eligible pools.
+ * 3. Sort eligible by {@link compareStoredPools}: `lastSwapBlock` desc (never-swapped last),
  *    then `liquidity` desc, then `poolId` asc.
- * 3. Primary = the first `cfg.MAX_TRACKED_POOLS` of that order.
- * 4. Pair completion: every *eligible* pool that shares its (currency0, currency1) pair with a
+ * 4. Primary = the first `cfg.MAX_TRACKED_POOLS` of that order.
+ * 5. Pair completion: every *eligible* pool that shares its (currency0, currency1) pair with a
  *    primary pool is added as well (a 2-hop arb needs at least two pools on one pair), so the
  *    result may exceed `MAX_TRACKED_POOLS` by those siblings.
- * 5. The result keeps the order of step 2 (siblings are merged into their sorted position, not
+ * 6. The result keeps the order of step 3 (siblings are merged into their sorted position, not
  *    appended), so callers that truncate further keep the most active pools.
  */
 export function selectTrackedPools(
   cfg: Pick<Config, 'allowedHooks' | 'MIN_POOL_LIQUIDITY' | 'MAX_TRACKED_POOLS'>,
   store: PoolStore,
+  opts: SelectOptions = {},
 ): PoolInfo[] {
-  const eligible = Object.values(store.pools).filter((p) => isEligible(cfg, p)).sort(compareStoredPools)
+  let eligible = Object.values(store.pools).filter((p) => isEligible(cfg, p))
+  if (opts.startCurrencies) {
+    const capable = cycleCapablePools(eligible, opts.startCurrencies)
+    eligible = eligible.filter((p) => capable.has(p.poolId))
+  }
+  eligible.sort(compareStoredPools)
   const cap = Math.max(0, cfg.MAX_TRACKED_POOLS)
   const selected = new Set<Hex>()
   const primaryPairs = new Set<string>()
@@ -224,6 +242,55 @@ export function selectTrackedPools(
   }
   for (const p of eligible) if (primaryPairs.has(pairKey(p))) selected.add(p.poolId)
   return eligible.filter((p) => selected.has(p.poolId)).map(toPoolInfo)
+}
+
+/**
+ * Ids of the pools in `pools` that can lie on at least one closed 2- or 3-hop cycle starting in
+ * one of `starts` (the same cycle shapes `strategy/buildCycles` enumerates):
+ *
+ * - 2-hop: the pool touches a start currency and at least one other pool exists on its pair.
+ * - 3-hop: the pool's two currencies have a common neighbour in the token graph that closes a
+ *   triangle containing a start currency (either an endpoint of the pool is a start currency, or
+ *   the common neighbour is one).
+ *
+ * This is exact for the cycle shapes above and costs O(pools * min-degree), so it is cheap enough
+ * to run on every selection.
+ */
+export function cycleCapablePools(pools: readonly PoolInfo[], starts: ReadonlySet<Address>): Set<Hex> {
+  const pairCount = new Map<string, number>()
+  const neighbours = new Map<Address, Set<Address>>()
+  for (const p of pools) {
+    if (p.currency0 === p.currency1) continue
+    pairCount.set(pairKey(p), (pairCount.get(pairKey(p)) ?? 0) + 1)
+    addNeighbour(neighbours, p.currency0, p.currency1)
+    addNeighbour(neighbours, p.currency1, p.currency0)
+  }
+  const capable = new Set<Hex>()
+  for (const p of pools) {
+    if (p.currency0 === p.currency1) continue
+    const touchesStart = starts.has(p.currency0) || starts.has(p.currency1)
+    if (touchesStart && (pairCount.get(pairKey(p)) ?? 0) >= 2) {
+      capable.add(p.poolId)
+      continue
+    }
+    const n0 = neighbours.get(p.currency0) ?? new Set<Address>()
+    const n1 = neighbours.get(p.currency1) ?? new Set<Address>()
+    if (hasCommonNeighbour(n0, n1, touchesStart ? undefined : starts)) capable.add(p.poolId)
+  }
+  return capable
+}
+
+function addNeighbour(sets: Map<Address, Set<Address>>, from: Address, to: Address): void {
+  const set = sets.get(from)
+  if (set) set.add(to)
+  else sets.set(from, new Set([to]))
+}
+
+/** True if `a` and `b` share an element; with `restrictTo`, the shared element must also be in it. */
+function hasCommonNeighbour(a: ReadonlySet<Address>, b: ReadonlySet<Address>, restrictTo?: ReadonlySet<Address>): boolean {
+  const candidates = restrictTo ?? (a.size <= b.size ? a : b)
+  for (const c of candidates) if (a.has(c) && b.has(c)) return true
+  return false
 }
 
 /** Strip discovery statistics, returning the plain {@link PoolInfo}. */
