@@ -84,6 +84,25 @@ These notes drive the design decisions in `ARCHITECTURE.md`.
   Price them only through `V4Quoter.quoteExactInput` (multi-hop in one call) and enforce `minProfit`.
 - `eth_call` without `gasPrice` runs with `BASEFEE = 0` on reth.
 
+## Mixed native / ERC-20 USDC accounting inside PoolManager.unlock (verified on Arc Foundry forks and live eth_call)
+
+- `balanceOf(0x3600…)` uses the BALANCE opcode (floor of wei / 1e12); only writes go through the
+  `0x1800…` system contract (selector `transfer(address,address,uint256)` with 18-dec amounts; ~12k gas
+  warm, ~49k cold). `0x1800…` rejects every caller that is not allow-listed, so there is no cheaper
+  wrap than `USDC.transfer` itself.
+- Inside one unlock the PoolManager nets `address(0)` and `0x3600…` separately. A closed cycle that
+  touches both needs no conversion; only a cycle that starts in one form and ends in the other needs the
+  executor's wallet. Rule: take every positive delta first, then pay native with `settle{value}` (with
+  nothing synced), then `sync(0x3600) → transfer → settle()` with no other balance movement in between.
+  A native `take` between `sync(0x3600)` and `settle()` underflows or silently strands funds.
+- The executor's close order follows this rule; three mixed shapes (native start/ERC-20 end, ERC-20
+  start/native end, closed native/ERC-20 two-pool cycle) passed on an `arc-forge` fork.
+- Native/ERC-20 USDC pools: the only liquid one (`0xc8a1b341…`, fee 9.99 bp) sits +0.9 bp off parity
+  with under 1 USDC of native-side depth; swapping `0x3600 → native` beyond that depth walks to the price
+  limit and burns ~25M gas. Cap sizes on such pools.
+- Measured gas (tx-level, warm): empty unlock 43k; 2-hop hookless USDC/EURC cycle with ERC-20 close
+  133–147k; mixed 3-hop 168k; native close +17k; ERC-20 close +51k cold.
+
 ## Hooked pools: what the hooks actually do
 
 - The four market-maker hooks (`0x285f3cc5…`, `0x16e40ea8…`, `0x58f2cee5…`, `0x50e4e362…`; flags 0x5c7 =

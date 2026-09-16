@@ -288,3 +288,18 @@ Shared types already carry what is needed: `PoolInfo.kind/pool/venue` (`poolKind
   "reduce size", not "pool broken": halve the input and retry within the same probe budget.
 - Budget ~25–45k extra gas per hooked hop when quoting profitability.
 - Optionally read `paused()` (`0x5c975abb`) on a hook once per N blocks and skip paused hooks.
+
+#### Notes for the stage 2 integrator (from research that landed during the build)
+
+- Lower the default `MIN_POOL_LIQUIDITY` to `100000000` (1e8): v3/v4 liquidity `L` scales with
+  `sqrt(units0 * units1)`, so the deepest pool on Arc (cirBTC/USDC 0.01% v3, 8-dec × 6-dec) has
+  `L ≈ 4.0e11` and is excluded by the old 1e12 default. Update `.env.example` and the README table.
+- The executor's `_swapV3` no longer passes `abi.encode(input)` as callback data (it passes empty bytes
+  and reads the input currency from transient storage). Nothing in TypeScript depends on that.
+- v2 guards: `expected` is the derived sqrtPriceX96 (see the ABI section), not reserve0. The calldata
+  vector test in `contracts/test/vectors/ExecCalldataVectors.t.sol` and `test/exec` must use that.
+- Gas numbers measured live (tx-level, warm): 2-hop hookless v4 cycle ≈ 133–147k; each extra hookless
+  v4 hop ≈ 21–30k; native close ≈ +17k; ERC-20 USDC close ≈ +51k cold (the predeploy routes through a
+  system contract); a v3 hop ≈ 200k+ cold; hooked v4 quote ≈ 62–84k vs 37k hookless. `QUOTE_GAS`
+  defaults (400k) are conservative; consider per-kind estimates: 150k + 30k per extra v4 hop + 200k per
+  v3 hop + 60k per v2 hop + 50k if the cycle bridges USDC forms.
