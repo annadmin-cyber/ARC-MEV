@@ -102,16 +102,16 @@ export interface Candidate {
   opp: EvaluatedOpportunity
   /** Expected gross profit in USDC wei (18 decimals). */
   expected18: bigint
-  /** Fee quote at `cfg.GAS_LIMIT` (before any gas estimate exists). */
+  /** Fee quote at `cfg.QUOTE_GAS` (before any gas estimate exists). */
   quote: FeeQuote
 }
 
 /**
- * Keep the opportunities whose net profit at the current base fee and `cfg.GAS_LIMIT` exceeds
+ * Keep the opportunities whose net profit at the current base fee and `cfg.QUOTE_GAS` exceeds
  * `MIN_PROFIT_USDC_WEI`, in ranking order, at most `max` of them.
  */
 export function quoteCandidates(
-  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY' | 'GAS_LIMIT' | 'MIN_PROFIT_USDC_WEI'>,
+  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY' | 'QUOTE_GAS' | 'MIN_PROFIT_USDC_WEI'>,
   opps: readonly EvaluatedOpportunity[],
   baseFee: bigint,
   max = 3,
@@ -121,7 +121,7 @@ export function quoteCandidates(
     if (out.length >= max) break
     const expected18 = opp.grossProfitUsdc
     if (expected18 === undefined) continue
-    const quote = feePolicy(cfg, baseFee, expected18, BigInt(cfg.GAS_LIMIT))
+    const quote = feePolicy(cfg, baseFee, expected18, BigInt(cfg.QUOTE_GAS))
     if (!quote || quote.net <= cfg.MIN_PROFIT_USDC_WEI) continue
     out.push({ opp, expected18, quote })
   }

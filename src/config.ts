@@ -45,8 +45,11 @@ const schema = z.object({
   SEND_RPC_URLS: z.string().default(''),
   /** sqrtPrice tolerance (bps) for on-chain state guards; 0 disables guards. */
   GUARD_TOLERANCE_BPS: z.coerce.number().int().min(0).default(1),
-  /** Gas limit used for execute() transactions. */
+  /** Upper bound on the gas limit of execute() transactions (used when estimation fails). */
   GAS_LIMIT: z.coerce.number().int().default(1_500_000),
+  /** Gas assumed when quoting profitability before an on-chain estimate exists. A 2-hop v4 cycle
+   *  uses ~250-350k gas; keep this close to reality or good opportunities are rejected early. */
+  QUOTE_GAS: z.coerce.number().int().min(21_000).default(400_000),
 
   /** Only pools whose liquidity is at least this are tracked. */
   MIN_POOL_LIQUIDITY: bigintStr('1000000000000'),

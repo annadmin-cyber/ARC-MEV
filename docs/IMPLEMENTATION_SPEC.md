@@ -186,3 +186,87 @@ main.ts: block loop as described in docs/ARCHITECTURE.md; DRY_RUN logs "would se
 cli/discover.ts: scan + refresh liquidity + activity + save + print stats.
 cli/scan.ts: load store, select pools, fetch states at latest block, evaluate all cycles, print top 20.
 ```
+
+## Stage 2: more venues, hooked pools, sharper gas
+
+Stage 1 (above) is complete: a v4-hookless arbitrage bot, verified live in dry-run. Stage 2 extends it.
+Shared types already carry what is needed: `PoolInfo.kind/pool/venue` (`poolKind()`, `addressToPoolId()`),
+`PoolState.reserves`, `ExecutorStep.kind/pool`, `StateGuard.kind`, `ADDRESSES[chain].v3Factories/v2Factories`
+(`VenueFactory`), `ADDRESSES[chain].v4Quoter`, config `QUOTE_GAS`.
+
+### 2A. v3-style and v2-style venues (owner: venues agent — `src/discovery`, `src/state`, `src/math`, `test/data`, `test/math`)
+
+- Discovery: for each `VenueFactory` in `ADDRESSES[chain].v3Factories` scan
+  `PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)`;
+  for each in `v2Factories` scan `PairCreated(address indexed token0, address indexed token1, address pair, uint256)`.
+  Upsert into the same `PoolStore` with `kind`, `pool`, `venue`, `poolId = addressToPoolId(pool)`, `fee`
+  (v2: `factory.feePips`), `tickSpacing` (v2: 0), `hooks` = zero. Resume per factory: keep
+  `store.venues[name].lastScannedBlock` (add the field to `PoolStore`; v4 keeps `lastScannedBlock`).
+- Liquidity refresh: v3 `liquidity()` and v2 `getReserves()` through Multicall3 `aggregate3` (allowFailure),
+  ≤ 300 calls per aggregate. Store v2 "liquidity" as `isqrt(reserve0 * reserve1)` so the existing
+  `MIN_POOL_LIQUIDITY` / ordering keep working. Activity: v3 `Swap(address indexed sender, address indexed
+  recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)` and v2
+  `Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)`
+  by topic over the look-back range, matched to known pool addresses (no address filter; bisect on the 20k cap).
+- State (`fetchPoolStates` must accept mixed kinds and dispatch):
+  - v3: Multicall3 batch of `slot0()`, `liquidity()`, `tickBitmap(int16)` for the window words, then
+    `ticks(int24)` for set bits. Decode `slot0` and `ticks` from the **leading words only**
+    (sqrtPriceX96, tick; liquidityGross, liquidityNet) so v3 forks with extra fields still decode.
+    Fill `PoolState` exactly like v4 with `lpFee = info.fee`, `protocolFee = 0`, `tickSpacing = info.tickSpacing`.
+  - v2: one `getReserves()` per pair (batched). Fill `reserves`, and derive for ranking:
+    `sqrtPriceX96 = isqrt(reserve1 * 2^192 / reserve0)`, `tick = getTickAtSqrtPrice(...)`,
+    `liquidity = isqrt(reserve0 * reserve1)`, `lpFee = info.fee`, empty `ticks`, `tickWindow = {MIN_TICK, MAX_TICK}`.
+- `StateCache.applyBlock`: one `eth_getLogs` for the block with **no address filter** and topics
+  `[v4 Swap | v4 ModifyLiquidity | v3 Swap | v3 Mint | v3 Burn | v2 Sync]` (any-of on topic0), then
+  route by emitter address / pool id to the tracked pool. v3 Swap → sqrtPrice/tick/liquidity in place;
+  v3 Mint/Burn → refetch that pool; v2 Sync → reserves in place. Keep the v4 behaviour unchanged.
+- Math: `simulateV2ExactInput(reserves, feePips, zeroForOne, amountIn): SwapResult` (UniswapV2 formula:
+  `amountInWithFee = amountIn * (1e6 - fee)`, `out = amountInWithFee * rOut / (rIn * 1e6 + amountInWithFee)`),
+  and `simulateHop(info: PoolInfo, state: PoolState, zeroForOne, amountIn): SwapResult` dispatching on
+  `poolKind(info)`: v4 → `simulateExactInput`, v3 → `simulateExactInput` with `protocolFee` forced to 0
+  (v3 protocol fees come out of the LP fee and do not change the output), v2 → the v2 formula.
+  Export a `Simulator`-compatible closure factory `makeSimulator(infos: Map<Hex, PoolInfo>)`.
+- Tests: decoding fixtures for v3 `slot0`/`ticks` with extra trailing words, v2 derivation, a v2 math
+  vector set generated with Foundry from a real `UniswapV2Pair`-equivalent formula (or hand-computed
+  with known reserves), StateCache routing of v3/v2 events, discovery upsert/resume per venue on a
+  synthetic store; a live test (skipped without `ARC_RPC_URL`) that fetches state for the v3
+  cirBTC/USDC 0.01% pool `0x82916bee18fcef517b26c72d7cb5f13694e1db41` and one Uniswap v2 pair.
+
+### 2B. Cross-kind execution, hooked-pool probing, gas and resilience (owner: exec agent — `src/exec`, `src/strategy`, `src/main.ts`, `src/cli`, `test/exec`, `test/strategy`)
+
+- `toExecutorSteps` / `toGuards` by kind: v3/v2 steps set `kind`, `pool`, `key.currency0/1`, `key.fee`
+  (v2 fee pips; v3 fee), `tickSpacing 0`, `hooks 0`. Guards: v3 `{kind 1, poolId: addressToPoolId(pool), expected: sqrtPriceX96}`,
+  v2 `{kind 2, poolId: addressToPoolId(pair), expected: reserve0}`.
+- Cycle building must accept mixed kinds (it already keys on poolId); the evaluation must use
+  `simulateHop` (2A) instead of `simulateExactInput` directly.
+- **Hooked-pool probe** (`src/strategy/probe.ts`, config `PROBE_HOOKED_POOLS` default true,
+  `PROBE_MAX_PER_BLOCK` default 4, `PROBE_MIN_SPREAD_BPS` default 30, `PROBE_GRID` default 5):
+  hooked v4 pools cannot be simulated locally, but `V4Quoter.quoteExactInput(QuoteExactParams{exactCurrency,
+  PathKey[] path, uint128 exactAmount})` (`0xca253dc9`, non-view; call it with `eth_call`, it returns
+  `(amountOut, gasEstimate)`) prices a whole multi-hop path in one call. Keep a "probe set" of the most
+  active hooked pools (from `refreshActivity`), with only `sqrtPriceX96` tracked (from Swap logs).
+  On each block, for every touched hooked pool P on pair (A,B): for each tracked pool Q (any kind) on the
+  same pair whose spot price differs from P's by more than `PROBE_MIN_SPREAD_BPS`, build the two 2-hop
+  cycles through P and Q that start in a start currency and quote them at `PROBE_GRID` log-spaced inputs
+  between minInput and maxInput in **one JSON-RPC batch** of `eth_call`s (the V4Quoter can quote the
+  hooked hop; quote the non-hooked hop locally with `simulateHop` and chain: for the cycle "start → P → Q →
+  start" quote P on-chain then Q locally; for "start → Q → P → start" simulate Q locally then quote P
+  on-chain). Pick the best grid point, refine once around it, and emit `Opportunity`s into the normal
+  ranking → on-chain executor simulation → send path. Cap at `PROBE_MAX_PER_BLOCK` probed pairs per block,
+  most-spread first. Log at debug how many probes ran and their latency.
+- Gas: `readNextBaseFee(block)`: parse the current block header's `extraData` as an 8-byte big-endian
+  integer = next block's base fee (verified on Arc); fall back to `baseFeePerGas * 1125 / 1000` if the
+  field is not exactly 8 bytes. Use it in `quoteCandidates` and `planFor`. Fetch the header concurrently
+  with `cache.applyBlock`, not after it.
+- Resilience: WS stall watchdog (no head for `WS_STALL_MS`, default 3000 → switch to polling and log);
+  optional `WS_URLS` (comma list) racing several `newHeads` subscriptions and de-duplicating by block
+  number; `MAX_CONSECUTIVE_REVERTS` (default 3) circuit breaker that pauses sending for
+  `BREAKER_PAUSE_BLOCKS` (default 120) after that many reverted or lost sends, and a rolling
+  `GAS_BUDGET_USDC_WEI` per `GAS_BUDGET_WINDOW_BLOCKS` (defaults 5 USDC / 7200 blocks) after which the
+  bot only dry-runs until the window rolls. Add these to `config.ts` (this agent may edit config.ts and
+  `.env.example`; keep existing fields).
+- `cli/scan` prints the pool kind/venue per hop and marks probed (hooked) cycles.
+- Tests: encode/guards for v3/v2 steps with a Solidity calldata vector (extend
+  `contracts/test/vectors/ExecCalldataVectors.t.sol`), `readNextBaseFee` parsing (fixture header from
+  Arc with `extraData` 0x0000001e78249c77 = 130.86 gwei), probe grid/batching with a fake transport,
+  breaker and budget logic, watchdog fallback with fake timers.
