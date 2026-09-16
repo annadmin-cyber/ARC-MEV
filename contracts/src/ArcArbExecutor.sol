@@ -11,6 +11,8 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 /// @dev Minimal Uniswap-v3-style pool surface (works for most forks; callback selector is not assumed).
 interface IV3PoolMinimal {
@@ -52,6 +54,10 @@ contract ArcArbExecutor is IUnlockCallback {
 
     /// @dev Transient slot holding the pool allowed to call back during a v3-style swap.
     bytes32 internal constant CALLBACK_POOL_SLOT = keccak256("ArcArbExecutor.callbackPool");
+    /// @dev Transient slot holding how much input the current v3-style swap may still pay out.
+    bytes32 internal constant CALLBACK_ALLOWANCE_SLOT = keccak256("ArcArbExecutor.callbackAllowance");
+    /// @dev Transient slot holding the input currency the current v3-style swap pays with.
+    bytes32 internal constant CALLBACK_CURRENCY_SLOT = keccak256("ArcArbExecutor.callbackCurrency");
 
     /// @notice One hop of the cycle.
     /// @dev `key.currency0/currency1` are the pool's token0/token1 for every kind and define the
@@ -67,7 +73,9 @@ contract ArcArbExecutor is IUnlockCallback {
     /// @notice Cheap pre-flight check: revert before swapping if a pool moved since simulation.
     /// @dev kind 0: `poolId` is the v4 pool id, `expected` its sqrtPriceX96.
     ///      kind 1: `poolId` is the v3 pool address, `expected` its slot0 sqrtPriceX96.
-    ///      kind 2: `poolId` is the v2 pair address, `expected` its reserve0.
+    ///      kind 2: `poolId` is the v2 pair address, `expected` its price as sqrtPriceX96 =
+    ///              sqrt(reserve1 / reserve0) * 2^96 (see `v2SqrtPriceX96`), so `toleranceBps` means
+    ///              the same thing for every kind.
     ///      `toleranceBps` is the allowed |actual - expected| in basis points of expected.
     struct Guard {
         uint8 kind;
@@ -92,6 +100,8 @@ contract ArcArbExecutor is IUnlockCallback {
     error Unprofitable(int256 delta, uint256 minProfit);
     error StaleState(uint256 guardIndex, uint160 actual);
     error UnexpectedCallback(address caller);
+    error CallbackOverpay(uint256 requested, uint256 allowed);
+    error InvalidCallbackDeltas(int256 amount0Delta, int256 amount1Delta);
     error CallFailed(bytes reason);
 
     event Executed(Currency indexed currency, uint256 amountIn, uint256 profit, uint256 steps);
@@ -167,13 +177,17 @@ contract ArcArbExecutor is IUnlockCallback {
         // `inManager` means `amount` of `current` is a positive delta inside the PoolManager (or, for
         // the very first hop, may be drawn from it as a flash loan); otherwise this contract holds it.
         bool inManager = true;
+        // Set once any hop moved tokens through this contract's wallet (v3/v2 hops). Such cycles are
+        // always closed with wallet accounting so partially filled hops are measured exactly.
+        bool usedWallet = false;
 
         for (uint256 i = 0; i < steps.length; ++i) {
+            if (steps[i].kind != KIND_V4) usedWallet = true;
             (current, amount, inManager) = _hop(steps[i], current, amount, inManager, i);
         }
 
         uint256 profit;
-        if (inManager && current == start) {
+        if (!usedWallet && inManager && current == start) {
             // Plain closed cycle: every intermediate currency netted to zero, only the start delta remains.
             int256 net = POOL_MANAGER.currencyDelta(address(this), start);
             if (net < 0 || uint256(net) < minProfit) revert Unprofitable(net, minProfit);
@@ -241,15 +255,15 @@ contract ArcArbExecutor is IUnlockCallback {
 
     function _swapV3(Step memory step, Currency input, Currency output, uint256 amount) internal returns (uint256 received) {
         uint256 before = output.balanceOfSelf();
-        _setCallbackPool(step.pool);
+        _setCallback(step.pool, input, amount);
         IV3PoolMinimal(step.pool).swap(
             address(this),
             step.zeroForOne,
             int256(amount),
             step.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
-            abi.encode(Currency.unwrap(input))
+            ""
         );
-        _setCallbackPool(address(0));
+        _setCallback(address(0), CurrencyLibrary.ADDRESS_ZERO, 0);
         received = output.balanceOfSelf() - before;
     }
 
@@ -270,6 +284,8 @@ contract ArcArbExecutor is IUnlockCallback {
     /// @dev Pays `amount` of `currency` from this contract into the PoolManager, creating a credit.
     function _pay(Currency currency, uint256 amount) internal {
         if (currency.isAddressZero()) {
+            // Reset any currency a hook may have left synced; settling native with one synced reverts.
+            POOL_MANAGER.sync(CurrencyLibrary.ADDRESS_ZERO);
             POOL_MANAGER.settle{value: amount}();
         } else {
             POOL_MANAGER.sync(currency);
@@ -278,13 +294,19 @@ contract ArcArbExecutor is IUnlockCallback {
         }
     }
 
+    /// @dev Pays the calling pool the input it is owed: only the currency this contract chose for the
+    ///      hop, and never more than the hop's input amount in total. The pool address is
+    ///      operator-supplied, so these bounds are what keep a hostile "pool" from draining balances
+    ///      this contract holds between runs. The callback's `data` argument is ignored on purpose.
     function _handleV3Callback(bytes calldata callData) internal {
-        address pool = _callbackPool();
+        (address pool, Currency input, uint256 allowance) = _callback();
         if (pool == address(0) || msg.sender != pool) revert UnexpectedCallback(msg.sender);
-        (int256 amount0Delta, int256 amount1Delta, bytes memory data) = abi.decode(callData[4:], (int256, int256, bytes));
-        address tokenIn = abi.decode(data, (address));
+        (int256 amount0Delta, int256 amount1Delta) = abi.decode(callData[4:], (int256, int256));
+        if ((amount0Delta > 0) == (amount1Delta > 0)) revert InvalidCallbackDeltas(amount0Delta, amount1Delta);
         uint256 owed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
-        Currency.wrap(tokenIn).transfer(msg.sender, owed);
+        if (owed > allowance) revert CallbackOverpay(owed, allowance);
+        _setCallback(pool, input, allowance - owed);
+        input.transfer(msg.sender, owed);
     }
 
     function _checkGuards(Guard[] calldata guards) internal view {
@@ -300,8 +322,8 @@ contract ArcArbExecutor is IUnlockCallback {
                 if (!ok || ret.length < 32) revert StaleState(i, 0);
                 actual = uint160(abi.decode(ret, (uint256)));
             } else if (g.kind == KIND_V2) {
-                (uint112 reserve0,,) = IV2PairMinimal(address(uint160(uint256(g.poolId)))).getReserves();
-                actual = reserve0;
+                (uint112 reserve0, uint112 reserve1,) = IV2PairMinimal(address(uint160(uint256(g.poolId)))).getReserves();
+                actual = v2SqrtPriceX96(reserve0, reserve1);
             } else {
                 revert UnknownKind(i);
             }
@@ -309,6 +331,17 @@ contract ArcArbExecutor is IUnlockCallback {
             uint256 diff = actual > expected ? actual - expected : expected - actual;
             if (diff * 10_000 > expected * g.toleranceBps) revert StaleState(i, uint160(actual));
         }
+    }
+
+    /// @notice The price of a v2-style pair expressed like a v3/v4 sqrtPriceX96: sqrt(reserve1 / reserve0) * 2^96.
+    /// @dev Exact (floor) when reserve1 / reserve0 < 2^64; otherwise falls back to a quotient of integer
+    ///      square roots, accurate to about 1 / sqrt(reserve) relative. Returns 0 when reserve0 is 0.
+    function v2SqrtPriceX96(uint256 reserve0, uint256 reserve1) public pure returns (uint160) {
+        if (reserve0 == 0) return 0;
+        if (reserve1 / reserve0 < (1 << 64)) {
+            return uint160(FixedPointMathLib.sqrt(FullMath.mulDiv(reserve1, 1 << 192, reserve0)));
+        }
+        return uint160((FixedPointMathLib.sqrt(reserve1) << 96) / FixedPointMathLib.sqrt(reserve0));
     }
 
     function _sameMoney(Currency a, Currency b) internal pure returns (bool) {
@@ -319,18 +352,29 @@ contract ArcArbExecutor is IUnlockCallback {
         return c.isAddressZero() || Currency.unwrap(c) == USDC_ERC20;
     }
 
-    function _setCallbackPool(address pool) internal {
-        bytes32 slot = CALLBACK_POOL_SLOT;
+    function _setCallback(address pool, Currency input, uint256 allowance) internal {
+        bytes32 poolSlot = CALLBACK_POOL_SLOT;
+        bytes32 currencySlot = CALLBACK_CURRENCY_SLOT;
+        bytes32 allowanceSlot = CALLBACK_ALLOWANCE_SLOT;
+        address currency = Currency.unwrap(input);
         assembly ("memory-safe") {
-            tstore(slot, pool)
+            tstore(poolSlot, pool)
+            tstore(currencySlot, currency)
+            tstore(allowanceSlot, allowance)
         }
     }
 
-    function _callbackPool() internal view returns (address pool) {
-        bytes32 slot = CALLBACK_POOL_SLOT;
+    function _callback() internal view returns (address pool, Currency input, uint256 allowance) {
+        bytes32 poolSlot = CALLBACK_POOL_SLOT;
+        bytes32 currencySlot = CALLBACK_CURRENCY_SLOT;
+        bytes32 allowanceSlot = CALLBACK_ALLOWANCE_SLOT;
+        address currency;
         assembly ("memory-safe") {
-            pool := tload(slot)
+            pool := tload(poolSlot)
+            currency := tload(currencySlot)
+            allowance := tload(allowanceSlot)
         }
+        input = Currency.wrap(currency);
     }
 
     // ---------------------------------------------------------------------

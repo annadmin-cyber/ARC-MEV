@@ -266,6 +266,52 @@ contract ArcArbExecutorTest is Deployers {
         ok;
     }
 
+    function test_v3Callback_cannotDrainHeldBalances() public {
+        // Executor holds 100 token1 of accumulated profit. A hostile "pool" supplied by a (stolen)
+        // operator key demands far more than the hop amount in the callback.
+        t1.transfer(address(exec), 100e18);
+        GreedyV3Pool evil = new GreedyV3Pool(t0, t1);
+        t0.transfer(address(evil), 10e18);
+
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false); // token1 -> token0 on v4 (creates a small token1 debt)
+        steps[1] = _ext(1, address(evil), currency0, currency1, 3000, true); // token0 -> token1 via evil
+
+        vm.prank(operator);
+        vm.expectPartialRevert(ArcArbExecutor.CallbackOverpay.selector);
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+        assertEq(t1.balanceOf(address(exec)), 100e18, "held profit untouched");
+    }
+
+    function test_v3Callback_ignoresPoolSuppliedTokenInData() public {
+        // Executor holds token0 profit; a hostile pool names token0 in `data` while the hop pays token1.
+        t0.transfer(address(exec), 50e18);
+        TokenNamingV3Pool evil = new TokenNamingV3Pool(t0, t1);
+        t0.transfer(address(evil), 10e18);
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, true); // token0 -> token1 on v4
+        steps[1] = _ext(1, address(evil), currency0, currency1, 3000, false); // token1 -> token0 via evil
+        vm.prank(operator);
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+        // The evil pool received token1 (the hop input), not the token0 it named. The executor keeps its
+        // 50 token0, gains the pool's 10 token0 payout and repays the 1 token0 v4 debt.
+        assertEq(t0.balanceOf(address(exec)), 50e18 + 10e18 - 1e18, "token0 profit untouched");
+        assertEq(t0.balanceOf(address(evil)), 0, "pool got no token0");
+        assertGt(t1.balanceOf(address(evil)), 0, "pool got the real input token");
+    }
+
+    function test_v3Callback_rejectsTwoPositiveDeltas() public {
+        GreedyV3Pool evil = new GreedyV3Pool(t0, t1);
+        evil.setBothPositive(true);
+        t0.transfer(address(evil), 10e18);
+        ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
+        steps[0] = _v4(poolA, false);
+        steps[1] = _ext(1, address(evil), currency0, currency1, 3000, true);
+        vm.prank(operator);
+        vm.expectPartialRevert(ArcArbExecutor.InvalidCallbackDeltas.selector);
+        exec.execute(steps, 1e18, 0, NO_GUARDS);
+    }
+
     function test_unknownKindReverts() public {
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](1);
         steps[0] = _ext(7, address(0), currency0, currency1, 0, true);
@@ -328,11 +374,12 @@ contract ArcArbExecutorTest is Deployers {
         MockV3Pool v3 = _deployV3(50e18, 100e18, ArcArbExecutor.uniswapV3SwapCallback.selector);
         MockV2Pair v2 = _deployV2(50e18, 100e18);
         (uint160 v3Price,,,,,,) = v3.slot0();
-        (uint112 r0,,) = v2.getReserves();
+        (uint112 r0, uint112 r1,) = v2.getReserves();
+        uint160 v2Price = exec.v2SqrtPriceX96(r0, r1);
 
         ArcArbExecutor.Guard[] memory guards = new ArcArbExecutor.Guard[](2);
         guards[0] = ArcArbExecutor.Guard({kind: 1, poolId: bytes32(uint256(uint160(address(v3)))), expected: v3Price, toleranceBps: 0});
-        guards[1] = ArcArbExecutor.Guard({kind: 2, poolId: bytes32(uint256(uint160(address(v2)))), expected: uint160(r0), toleranceBps: 0});
+        guards[1] = ArcArbExecutor.Guard({kind: 2, poolId: bytes32(uint256(uint160(address(v2)))), expected: v2Price, toleranceBps: 1});
 
         ArcArbExecutor.Step[] memory steps = new ArcArbExecutor.Step[](2);
         steps[0] = _v4(poolA, false);
@@ -343,12 +390,32 @@ contract ArcArbExecutorTest is Deployers {
         exec.execute(steps, 0.5e18, 1, guards);
         vm.revertToState(snap);
 
-        // Move the v2 pair: its guard must trip.
+        // Move the v2 pair's price: its guard must trip.
         t0.transfer(address(v2), 1e18);
         v2.sync();
+        (uint112 m0, uint112 m1,) = v2.getReserves();
+        uint160 movedPrice = exec.v2SqrtPriceX96(m0, m1);
         vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.StaleState.selector, 1, uint160(r0 + 1e18)));
+        vm.expectRevert(abi.encodeWithSelector(ArcArbExecutor.StaleState.selector, 1, movedPrice));
         exec.execute(steps, 0.5e18, 1, guards);
+
+        // A proportional liquidity add keeps the price: the guard must still pass.
+        vm.revertToState(snap);
+        t0.transfer(address(v2), 50e18);
+        t1.transfer(address(v2), 100e18);
+        v2.sync();
+        vm.prank(operator);
+        exec.execute(steps, 0.5e18, 1, guards);
+    }
+
+    function test_v2SqrtPriceX96_matchesV3Convention() public view {
+        // 1:1 reserves -> 2^96; 4:1 (reserve1 = 4 * reserve0) -> 2 * 2^96.
+        assertEq(exec.v2SqrtPriceX96(100e18, 100e18), uint160(1 << 96));
+        assertEq(exec.v2SqrtPriceX96(100e18, 400e18), uint160(2 << 96));
+        // Huge ratio falls back to the sqrt-quotient path and stays within 1e-6 of exact.
+        uint256 big = exec.v2SqrtPriceX96(1, 1 << 100);
+        assertApproxEqRel(big, uint256(1 << 50) << 96, 1e12);
+        assertEq(exec.v2SqrtPriceX96(0, 1e18), 0);
     }
 
     // ------------------------------------------------------------------
@@ -482,5 +549,58 @@ contract ArcArbExecutorTest is Deployers {
 
     function _sort(Currency a, Currency b) internal pure returns (Currency, Currency) {
         return Currency.unwrap(a) < Currency.unwrap(b) ? (a, b) : (b, a);
+    }
+}
+
+/// @dev A hostile v3-style pool that pays out all its token0 and names token0 as the token to be paid with.
+contract TokenNamingV3Pool {
+    MockERC20 internal immutable token0;
+    MockERC20 internal immutable token1;
+
+    constructor(MockERC20 _t0, MockERC20 _t1) {
+        token0 = _t0;
+        token1 = _t1;
+    }
+
+    function swap(address recipient, bool, int256 amountSpecified, uint160, bytes calldata) external returns (int256, int256) {
+        token0.transfer(recipient, token0.balanceOf(address(this)));
+        (bool ok,) = msg.sender.call(
+            abi.encodeWithSignature(
+                "uniswapV3SwapCallback(int256,int256,bytes)", -int256(10e18), amountSpecified, abi.encode(address(token0))
+            )
+        );
+        require(ok, "callback failed");
+        return (-int256(10e18), amountSpecified);
+    }
+}
+
+/// @dev A hostile v3-style pool: pays a token0 "output" then demands the caller's whole token1 balance.
+contract GreedyV3Pool {
+    MockERC20 internal immutable token0;
+    MockERC20 internal immutable token1;
+    bool internal bothPositive;
+
+    constructor(MockERC20 _t0, MockERC20 _t1) {
+        token0 = _t0;
+        token1 = _t1;
+    }
+
+    function setBothPositive(bool v) external {
+        bothPositive = v;
+    }
+
+    function swap(address recipient, bool, int256, uint160, bytes calldata data) external returns (int256, int256) {
+        token0.transfer(recipient, 1e18); // "output" the executor did not ask for, to look legitimate
+        uint256 demand = bothPositive ? 5e18 : token1.balanceOf(msg.sender);
+        int256 a0 = bothPositive ? int256(1) : int256(-1e18);
+        (bool ok, bytes memory ret) = msg.sender.call(
+            abi.encodeWithSignature("uniswapV3SwapCallback(int256,int256,bytes)", a0, int256(demand), data)
+        );
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        return (a0, int256(demand));
     }
 }

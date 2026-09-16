@@ -102,7 +102,9 @@ function execute(Step[] steps, uint256 amountIn, uint256 minProfit, Guard[] guar
   are zero for non-v4 hops.
 - Guards: kind 0 -> `poolId` is the v4 id and `expected` its sqrtPriceX96; kind 1 -> `poolId` is the v3
   pool address left-padded to 32 bytes and `expected` its slot0 sqrtPriceX96; kind 2 -> v2 pair address,
-  `expected` = reserve0.
+  `expected` = the pair price as sqrtPriceX96 = `isqrt(reserve1 * 2^192 / reserve0)` (exactly the value the
+  venues layer stores in `PoolState.sqrtPriceX96` for v2 pairs; the contract exposes `v2SqrtPriceX96()`).
+  So `toGuards` uses `state.sqrtPriceX96` for every kind.
 - A cycle may start in native USDC (address(0)) and end in the ERC-20 predeploy (0x3600…) or vice versa;
   the contract treats them as the same money (they are one balance on Arc) and measures profit in the
   start currency's units.
@@ -236,7 +238,7 @@ Shared types already carry what is needed: `PoolInfo.kind/pool/venue` (`poolKind
 
 - `toExecutorSteps` / `toGuards` by kind: v3/v2 steps set `kind`, `pool`, `key.currency0/1`, `key.fee`
   (v2 fee pips; v3 fee), `tickSpacing 0`, `hooks 0`. Guards: v3 `{kind 1, poolId: addressToPoolId(pool), expected: sqrtPriceX96}`,
-  v2 `{kind 2, poolId: addressToPoolId(pair), expected: reserve0}`.
+  v2 `{kind 2, poolId: addressToPoolId(pair), expected: state.sqrtPriceX96}` (derived from reserves, see the ABI section).
 - Cycle building must accept mixed kinds (it already keys on poolId); the evaluation must use
   `simulateHop` (2A) instead of `simulateExactInput` directly.
 - **Hooked-pool probe** (`src/strategy/probe.ts`, config `PROBE_HOOKED_POOLS` default true,
