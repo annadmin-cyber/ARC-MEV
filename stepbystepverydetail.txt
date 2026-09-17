@@ -127,39 +127,44 @@ PART 2  —  GET THE CODE
 PART 3  —  DISCOVER THE POOLS (no keys, no money)
 --------------------------------------------------------------------------
 
-The bot needs a list of every pool on Arc. This is built once and updated
-incrementally afterwards.
+The bot needs a list of every pool on Arc. The repo ships a snapshot of it
+(data/pools.5042.json.gz, every pool up to the day of the last commit), so
+discovery only has to scan the blocks created since then.
 
 3.1  Run discovery
 
     npm run discover
 
-    What happens: it scans the Uniswap v4 PoolManager history from block
-    1,948,056, then the Uniswap v3 and v2 / DYORSwap factories, reads the
-    liquidity of every pool, and counts recent swaps. On the public RPC this
-    takes roughly 10–15 minutes the first time. It saves progress every
-    100,000 blocks, so if it is interrupted just run it again and it resumes.
+    What happens: it loads the snapshot, scans the Uniswap v4 PoolManager
+    and the v3 / v2 / DYORSwap factories from the snapshot's last block to
+    now, reads the liquidity of every pool, and counts recent swaps. Through
+    Blockdaemon (the recommended RPC_URL) this takes 1-3 minutes. It saves
+    progress as it goes, so if it is interrupted just run it again.
+
+    If data/pools.5042.json already exists from an earlier, interrupted run,
+    delete it first so the snapshot is used:  rm data/pools.5042.json
 
 3.2  What you should see at the end
 
     A summary like:
-      pools: 33646, with liquidity: 20254, hookless with liquidity: 7170,
-      active (last 3000 blocks): 2550, tracked: 571
+      pools discovered: 104128, with liquidity: 25000, hookless with
+      liquidity: 14518, active in last 3000 blocks: 870, tracked: 685
 
     The file data/pools.5042.json now exists. Do not edit it by hand.
 
 3.3  Keep it fresh
 
-    Arc creates about one new pool per block. Re-run "npm run discover" once
-    a day (it only scans the new blocks, about 15 seconds). The bot warns you
-    at start-up if the file is older than 2 hours.
+    Arc creates many new pools per hour. Re-run "npm run discover" once a
+    day (it only scans the new blocks). The bot warns you at start-up if the
+    file is older than 2 hours. Blockdaemon keeps about one day of log
+    history: if you skip more than a day, delete data/pools.5042.json and
+    start again from the shipped snapshot, or update the snapshot from git.
 
-    Discovery reads the historical logs through DISCOVER_RPC_URL from .env
-    (default: NodeFlare's public archive endpoint), not RPC_URL, because the
-    backfill needs 10,000-block log ranges over the whole chain history. The
-    official gateway throttles those, dRPC's free plan caps ranges at ~100
-    blocks, and Blockdaemon / publicnode have pruned history. The liquidity
-    reads stay on RPC_URL, which any endpoint serves.
+    DISCOVER_RPC_URL in .env is only for scanning the whole chain history
+    without the snapshot. Leave it commented out. If you do need it, the
+    endpoint must serve 10,000-block log ranges over every block (NodeFlare
+    with a free API key does; its keyless endpoint refuses eth_getLogs for
+    many clients with a 403 "method_not_supported").
 
 Troubleshooting:
   - "rate limit exceeded" / "Request exceeds defined limit." / "HTTP request
@@ -167,8 +172,12 @@ Troubleshooting:
     retries automatically (up to 12 times with backoff). Only a line with
     "discover failed" (level 60) means it gave up.
   - "ranges over 10000 blocks are not supported on free plan": you are
-    scanning through dRPC; set DISCOVER_RPC_URL=https://rpc.nodeflare.app/arc/public
-  - "pruned history unavailable": Blockdaemon/publicnode; same fix as above.
+    scanning through dRPC; set RPC_URL=https://rpc.blockdaemon.mainnet.arc.io
+  - "pruned history unavailable": your store is more than a day behind
+    Blockdaemon's history; rm data/pools.5042.json and rerun to start from
+    the shipped snapshot.
+  - 403 "method_not_supported" from rpc.nodeflare.app: comment out
+    DISCOVER_RPC_URL in .env; it is not needed with the snapshot.
   - Discovery resumes from the last saved segment, so just rerun it.
 
 

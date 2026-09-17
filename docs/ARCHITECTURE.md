@@ -44,7 +44,10 @@ src/                       TypeScript bot (viem)
   abi/                     ABIs: PoolManager, executor, Multicall3, V4Quoter, v3 factory/pool, v2 factory/pair
   discovery/               PoolManager Initialize logs + PoolCreated / PairCreated logs of every configured
                            factory (resume point per venue), liquidity and swap-activity refresh for every
-                           kind, persisted in data/pools.<chain>.json; selectTrackedPools picks what to watch
+                           kind, persisted in data/pools.<chain>.json; a gzipped snapshot of it ships in the
+                           repo (data/pools.<chain>.json.gz) and is the starting point when the plain file
+                           is absent, so a fresh checkout only scans the blocks since the snapshot;
+                           selectTrackedPools picks what to watch
   state/                   per-block state: v4 via extsload, v3 via Multicall3 (slot0/liquidity/tickBitmap/
                            ticks, leading words only), v2 via getReserves; StateCache replays one unfiltered
                            eth_getLogs per block (six topics) and routes each log by emitter

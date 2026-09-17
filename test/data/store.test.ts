@@ -1,8 +1,9 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { emptyPoolStore, loadPoolStore, poolStorePath, savePoolStore, type PoolStore } from '../../src/discovery/store.js'
+import { emptyPoolStore, loadPoolStore, poolSnapshotPath, poolStorePath, savePoolStore, type PoolStore } from '../../src/discovery/store.js'
 import { LIVE_POOLS } from './fixtures.js'
 
 describe('PoolStore persistence', () => {
@@ -17,6 +18,31 @@ describe('PoolStore persistence', () => {
   it('returns an empty store when the file is missing', async () => {
     const cfg = { DATA_DIR: join(dir, 'nested', 'deeper'), CHAIN_ID: 5042 }
     expect(await loadPoolStore(cfg)).toEqual(emptyPoolStore(5042))
+  })
+
+  it('falls back to the gzipped snapshot when the store file is missing, and the next save writes the plain file', async () => {
+    const cfg = { DATA_DIR: join(dir, 'data'), CHAIN_ID: 5042 }
+    const store: PoolStore = emptyPoolStore(5042)
+    store.lastScannedBlock = 21_182_903
+    const p = LIVE_POOLS[0]!
+    store.pools[p.poolId] = { poolId: p.poolId, currency0: p.currency0, currency1: p.currency1, fee: p.fee, tickSpacing: p.tickSpacing, hooks: p.hooks, block: p.block }
+    await mkdir(cfg.DATA_DIR, { recursive: true })
+    expect(poolSnapshotPath(cfg)).toBe(join(cfg.DATA_DIR, 'pools.5042.json.gz'))
+    await writeFile(poolSnapshotPath(cfg), gzipSync(JSON.stringify(store)))
+    const loaded = await loadPoolStore(cfg)
+    expect(loaded).toEqual(store)
+    // The plain file takes precedence once it exists.
+    loaded.lastScannedBlock = 21_200_000
+    await savePoolStore(cfg, loaded)
+    expect((await loadPoolStore(cfg)).lastScannedBlock).toBe(21_200_000)
+    expect((await readdir(cfg.DATA_DIR)).sort()).toEqual(['pools.5042.json', 'pools.5042.json.gz'])
+  })
+
+  it('rejects a corrupt snapshot instead of silently starting empty', async () => {
+    const cfg = { DATA_DIR: join(dir, 'data'), CHAIN_ID: 5042 }
+    await mkdir(cfg.DATA_DIR, { recursive: true })
+    await writeFile(poolSnapshotPath(cfg), 'not gzip')
+    await expect(loadPoolStore(cfg)).rejects.toThrow()
   })
 
   it('round-trips through an atomic save (temp file + rename, directory created)', async () => {

@@ -115,7 +115,7 @@ function exitAfterFlush(code: number): Promise<never> {
 async function warnIfStale(cfg: Config, store: PoolStore): Promise<void> {
   const count = Object.keys(store.pools).length
   if (count === 0) {
-    log.warn('pool store is empty: run `npm run discover` (scans PoolManager Initialize logs, ~48k pools); continuing with nothing')
+    log.warn('pool store is empty: run `npm run discover` (starts from the shipped snapshot and scans the blocks since); continuing with nothing')
     return
   }
   try {

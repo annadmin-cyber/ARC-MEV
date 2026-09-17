@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { isAddress, isHex, type Hex } from 'viem'
 import { z } from 'zod'
 import type { Config } from '../config.js'
@@ -65,14 +66,22 @@ export function poolStorePath(cfg: Pick<Config, 'DATA_DIR' | 'CHAIN_ID'>): strin
   return join(cfg.DATA_DIR, `pools.${cfg.CHAIN_ID}.json`)
 }
 
+/** Path of the shipped snapshot: `<DATA_DIR>/pools.<chainId>.json.gz` (loaded when the store file is absent). */
+export function poolSnapshotPath(cfg: Pick<Config, 'DATA_DIR' | 'CHAIN_ID'>): string {
+  return `${poolStorePath(cfg)}.gz`
+}
+
 /** A store with nothing scanned yet. */
 export function emptyPoolStore(chainId: number): PoolStore {
   return { chainId, lastScannedBlock: 0, pools: {}, venues: {} }
 }
 
 /**
- * Load the store from disk, or return an empty one when the file does not exist. A file that
- * exists but is malformed or belongs to another chain throws rather than silently rescanning.
+ * Load the store from disk. When the store file does not exist, fall back to the gzipped snapshot
+ * shipped with the repo (`pools.<chainId>.json.gz`, so discovery only has to scan the blocks since
+ * the snapshot instead of the whole chain history), and when that is absent too return an empty
+ * store. A file that exists but is malformed or belongs to another chain throws rather than
+ * silently rescanning.
  */
 export async function loadPoolStore(cfg: Pick<Config, 'DATA_DIR' | 'CHAIN_ID'>): Promise<PoolStore> {
   const path = poolStorePath(cfg)
@@ -80,11 +89,16 @@ export async function loadPoolStore(cfg: Pick<Config, 'DATA_DIR' | 'CHAIN_ID'>):
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    const snapshot = poolSnapshotPath(cfg)
+    try {
+      text = gunzipSync(await readFile(snapshot)).toString('utf8')
+      log.info({ path, snapshot }, 'no pool store on disk, starting from the shipped snapshot')
+    } catch (snapshotError) {
+      if ((snapshotError as NodeJS.ErrnoException).code !== 'ENOENT') throw snapshotError
       log.info({ path }, 'no pool store on disk, starting empty')
       return emptyPoolStore(cfg.CHAIN_ID)
     }
-    throw error
   }
   const parsed = poolStoreSchema.parse(JSON.parse(text))
   if (parsed.chainId !== cfg.CHAIN_ID) {

@@ -3,6 +3,8 @@ dist/
 .env
 *.log
 data/*.local.json
+# Working pool store (the shipped snapshot is data/pools.<chain>.json.gz)
+data/pools.*.json
 contracts/out/
 contracts/cache/
 contracts/broadcast/
