@@ -3,7 +3,7 @@
  * operator address at the block the local state was read at, with `minProfit = 0` so the call
  * returns the realised profit instead of reverting on a small shortfall. Reverts are decoded
  * against the executor ABI (`Unprofitable`, `StaleState`, `PathBroken`, ...). When the call
- * succeeds the gas is estimated with `eth_estimateGas` on the same call, falling back to
+ * succeeds the gas comes from an `eth_estimateGas` issued concurrently on the same call, falling back to
  * `cfg.GAS_LIMIT` when the node refuses to estimate.
  */
 import {
@@ -104,11 +104,16 @@ export async function simulateOnChain(
   }
   const blockTag = toHex(block)
 
+  // The gas estimate is issued together with the call rather than after it: one round trip less
+  // on the head-to-send path, which decides who lands first on a 500 ms chain. When the call
+  // reverts the estimate is discarded (it reverts too, at no cost beyond the request).
+  const callPromise = callWhenReady(() =>
+    withRetry(() => clients.http.request({ method: 'eth_call', params: [call, blockTag] }), { label: 'eth_call execute' }),
+  )
+  const gasPromise = estimateGas(clients, cfg, call, blockTag)
   let returned: Hex
   try {
-    returned = await callWhenReady(() =>
-      withRetry(() => clients.http.request({ method: 'eth_call', params: [call, blockTag] }), { label: 'eth_call execute' }),
-    )
+    returned = await callPromise
   } catch (error) {
     return { ok: false, reason: describeRevert(error) }
   }
@@ -120,7 +125,7 @@ export async function simulateOnChain(
     return { ok: false, reason: `undecodable return data ${returned}: ${errorMessage(error)}` }
   }
 
-  const gas = await estimateGas(clients, cfg, call, blockTag)
+  const gas = await gasPromise
   return gas === undefined
     ? { ok: true, profit, gas: BigInt(cfg.GAS_LIMIT), gasSource: 'config' }
     : { ok: true, profit, gas, gasSource: 'estimate' }

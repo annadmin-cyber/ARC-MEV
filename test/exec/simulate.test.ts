@@ -82,11 +82,13 @@ describe('simulateOnChain', () => {
   it('reports the decoded custom error when execute reverts', async () => {
     const { client, calls } = fakeClient(async (method) => {
       if (method === 'eth_call') revert(UNPROFITABLE_HAND)
+      // The concurrent estimate reverts too; its failure must not mask the decoded call error.
+      if (method === 'eth_estimateGas') revert(UNPROFITABLE_HAND)
       throw new Error(`unexpected ${method}`)
     })
     const result = await simulateOnChain({ http: client }, withKey, opp, steps, guards, 4242n)
     expect(result).toEqual({ ok: false, reason: 'Unprofitable(-123, 0)' })
-    expect(calls).toHaveLength(1)
+    expect(calls.map((c) => c.method)).toEqual(['eth_call', 'eth_estimateGas'])
     expect(calls[0]!.params).toEqual([{ from: TEST_ADDRESS, to: EXECUTOR, data: expectedData }, '0x1092'])
   })
 
@@ -98,6 +100,7 @@ describe('simulateOnChain', () => {
     })
     const result = await simulateOnChain({ http: client }, withKey, opp, steps, guards, 100n)
     expect(result).toEqual({ ok: true, profit: 987_654n, gas: 200_000n, gasSource: 'estimate' })
+    // Both requests go out together (the estimate does not wait for the call), the call first.
     expect(calls.map((c) => c.method)).toEqual(['eth_call', 'eth_estimateGas'])
     expect(calls[1]!.params).toEqual(calls[0]!.params)
   })
