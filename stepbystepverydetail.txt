@@ -68,6 +68,29 @@ inside it.
     extract it to ~/.foundry/bin and add that directory to your PATH.
 
 
+1.4  Windows / WSL notes
+
+    - Install WSL2 with Ubuntu (PowerShell as admin: wsl --install), then do
+      EVERYTHING inside the Ubuntu terminal, not PowerShell.
+    - Clone into the Linux home directory (~/ARC-MEV), never into /mnt/c/...;
+      npm install and discovery are many times slower on the Windows drive.
+    - The monitor page opens directly in your Windows browser at
+      http://localhost:3000 (WSL2 forwards localhost). No tunnel needed.
+    - WSL stops when Windows sleeps or the terminal closes. Fine for setup,
+      dry runs and first live tests; for 24/7 move to a small Linux VM later.
+
+1.5  Starting with a small budget (for example 20 USDC)
+
+    - Send ~19 USDC to the OPERATOR address and ~1 USDC to the OWNER, or send
+      all 20 to the operator and deploy from the operator key (the owner only
+      needs a few cents later, when you sweep profit). Still set OWNER= to
+      your cold address in the deploy command.
+    - Tighten two settings in .env so one bad hour cannot drain the wallet:
+        GAS_BUDGET_USDC_WEI=2000000000000000000      # 2 USDC per hour
+        MAX_INPUT_USDC_WEI=300000000000000000000     # 300 USDC max trade size
+    - Top up before the operator balance drops below ~3 USDC.
+
+
 --------------------------------------------------------------------------
 PART 2  —  GET THE CODE
 --------------------------------------------------------------------------
