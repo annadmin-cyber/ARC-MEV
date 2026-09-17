@@ -154,11 +154,22 @@ incrementally afterwards.
     a day (it only scans the new blocks, about 15 seconds). The bot warns you
     at start-up if the file is older than 2 hours.
 
+    Discovery reads the historical logs through DISCOVER_RPC_URL from .env
+    (default: NodeFlare's public archive endpoint), not RPC_URL, because the
+    backfill needs 10,000-block log ranges over the whole chain history. The
+    official gateway throttles those, dRPC's free plan caps ranges at ~100
+    blocks, and Blockdaemon / publicnode have pruned history. The liquidity
+    reads stay on RPC_URL, which any endpoint serves.
+
 Troubleshooting:
-  - "rate limit exceeded" / "Request exceeds defined limit." lines: normal on
-    the public RPC, the scanner retries automatically.
-  - If it keeps failing, put a different endpoint in .env:
-      RPC_URL=https://rpc.drpc.mainnet.arc.io
+  - "rate limit exceeded" / "Request exceeds defined limit." / "HTTP request
+    failed" warning lines (level 40): normal on public endpoints, the scanner
+    retries automatically (up to 12 times with backoff). Only a line with
+    "discover failed" (level 60) means it gave up.
+  - "ranges over 10000 blocks are not supported on free plan": you are
+    scanning through dRPC; set DISCOVER_RPC_URL=https://rpc.nodeflare.app/arc/public
+  - "pruned history unavailable": Blockdaemon/publicnode; same fix as above.
+  - Discovery resumes from the last saved segment, so just rerun it.
 
 
 --------------------------------------------------------------------------

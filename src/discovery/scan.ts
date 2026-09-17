@@ -4,7 +4,7 @@ import { ADDRESSES, type VenueFactory } from '../chains.js'
 import type { Config } from '../config.js'
 import { log } from '../logger.js'
 import { isqrt } from '../math/v2.js'
-import { extsload, limiter, type RpcClients } from '../rpc/client.js'
+import { extsload, limiter, type RetryOptions, type RpcClients } from '../rpc/client.js'
 import { BACKFILL_RETRY, getLogsChunked, MAX_LOG_RANGE, safeHead, type RawLog } from '../rpc/logs.js'
 import { aggregate3, type Call3 } from '../rpc/multicall.js'
 import { decodeUint128, liquiditySlot } from '../state/slots.js'
@@ -278,6 +278,10 @@ export interface RefreshLiquidityOptions {
   batchSize?: number
   /** Calls per Multicall3 `aggregate3` (v3/v2 pools). Default 300. */
   multicallBatchSize?: number
+  /** Requests in flight across both readers. Default 2 (public endpoints answer 429 to bursts of 4). */
+  concurrency?: number
+  /** Retry policy per request. Default {@link BACKFILL_RETRY}. */
+  retry?: RetryOptions
 }
 
 const LIQUIDITY_CALL = encodeFunctionData({ abi: v3PoolAbi, functionName: 'liquidity' })
@@ -285,7 +289,7 @@ const GET_RESERVES_CALL = encodeFunctionData({ abi: v2PairAbi, functionName: 'ge
 
 /**
  * Read the liquidity of every pool in the store and store it as a decimal string: v4 pools via
- * `extsload` of the liquidity slot (800 per call, 4 in flight); v3-style pools via `liquidity()`
+ * `extsload` of the liquidity slot (800 per call, 2 in flight by default); v3-style pools via `liquidity()`
  * and v2-style pairs via `getReserves()` through Multicall3 `aggregate3` (allowFailure, at most
  * 300 calls each). A v2 pair's liquidity is `isqrt(reserve0 * reserve1)` so `MIN_POOL_LIQUIDITY`
  * and the activity/liquidity ordering apply uniformly. A v3/v2 read that reverts stores `"0"`.
@@ -300,7 +304,8 @@ export async function refreshLiquidity(
   const all = Object.values(store.pools)
   if (all.length === 0) return
   const block = opts.block ?? (await safeHead(clients.http))
-  const limit = limiter(4)
+  const limit = limiter(opts.concurrency ?? 2)
+  const retry = opts.retry ?? BACKFILL_RETRY
   const v4 = all.filter((p) => poolKind(p) === 0)
   const venue = all.filter((p) => poolKind(p) !== 0)
   let withLiquidity = 0
@@ -313,7 +318,7 @@ export async function refreshLiquidity(
       addresses.poolManager,
       v4.map((p) => liquiditySlot(p.poolId)),
       block,
-      { limit, ...(opts.batchSize === undefined ? {} : { batchSize: opts.batchSize }) },
+      { limit, retry, ...(opts.batchSize === undefined ? {} : { batchSize: opts.batchSize }) },
     )
     v4.forEach((p, i) => {
       const word = values[i]
@@ -328,6 +333,7 @@ export async function refreshLiquidity(
     const calls: Call3[] = venue.map((p) => ({ target: poolAddress(p), callData: poolKind(p) === 1 ? LIQUIDITY_CALL : GET_RESERVES_CALL }))
     const results = await aggregate3(clients, calls, block, {
       limit,
+      retry,
       ...(opts.multicallBatchSize === undefined ? {} : { batchSize: opts.multicallBatchSize }),
     })
     venue.forEach((p, i) => {
@@ -367,7 +373,7 @@ export async function refreshActivity(
   cfg: Config,
   store: PoolStore,
   lookbackBlocks: number = DEFAULT_LOOKBACK_BLOCKS,
-  opts: { toBlock?: bigint } = {},
+  opts: { toBlock?: bigint; concurrency?: number } = {},
 ): Promise<void> {
   const addresses = requireAddresses(cfg)
   const poolManager = addresses.poolManager.toLowerCase() as Address
@@ -379,6 +385,8 @@ export async function refreshActivity(
     events: [...SWAP, V3_SWAP, V2_SWAP],
     fromBlock: from,
     toBlock: to,
+    concurrency: opts.concurrency ?? 2,
+    retry: BACKFILL_RETRY,
   })
   let matched = 0
   for (const raw of logs) {

@@ -7,6 +7,7 @@
  *
  * All RPC traffic goes through a {@link SendTransport} so tests can drive the sender with a fake.
  */
+import { HTTP_FETCH_OPTIONS } from '../rpc/client.js'
 import {
   createPublicClient,
   formatTransactionReceipt,
@@ -44,7 +45,7 @@ export function httpSendTransport(): SendTransport {
   const clientFor = (url: string): PublicClient => {
     let client = perUrl.get(url)
     if (!client) {
-      client = createPublicClient({ transport: http(url, { batch: false, retryCount: 0, timeout: SEND_TIMEOUT_MS }) })
+      client = createPublicClient({ transport: http(url, { batch: false, retryCount: 0, timeout: SEND_TIMEOUT_MS, fetchOptions: HTTP_FETCH_OPTIONS }) })
       perUrl.set(url, client)
     }
     return client

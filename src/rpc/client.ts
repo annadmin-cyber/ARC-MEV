@@ -38,6 +38,13 @@ export interface RpcClients {
 const HTTP_TIMEOUT_MS = 20_000
 
 /**
+ * Identify the bot to RPC providers. Some public endpoints (NodeFlare, and the official gateway
+ * for Python's default agent) answer 403 to requests without a recognisable User-Agent.
+ */
+export const USER_AGENT = 'arc-mev-bot/0.1'
+export const HTTP_FETCH_OPTIONS = { headers: { 'user-agent': USER_AGENT } } as const
+
+/**
  * viem caps JSON-RPC response bodies at 10 MiB by default; a 20,000-log `eth_getLogs` answer
  * from Arc is ~10.5 MB, so allow 64 MiB (log fetches also bisect on oversized responses).
  */
@@ -54,9 +61,12 @@ export function makeClients(cfg: Config): RpcClients {
     chain,
     batch: { multicall: false },
     transport: http(cfg.RPC_URL, {
-      batch: true,
+      // JSON-RPC batching is off by default: dRPC's free tier rejects batch arrays (HTTP 400),
+      // the official gateway throttles entries inside batches, Blockdaemon caps them at 100.
+      batch: cfg.RPC_BATCH ? { batchSize: cfg.RPC_BATCH } : false,
       retryCount: 0,
       timeout: HTTP_TIMEOUT_MS,
+      fetchOptions: HTTP_FETCH_OPTIONS,
       maxResponseBodySize: MAX_RESPONSE_BODY_BYTES,
     }),
   })
@@ -67,6 +77,7 @@ export function makeClients(cfg: Config): RpcClients {
       batch: false,
       retryCount: 0,
       timeout: HTTP_TIMEOUT_MS,
+      fetchOptions: HTTP_FETCH_OPTIONS,
       maxResponseBodySize: MAX_RESPONSE_BODY_BYTES,
     }),
   })

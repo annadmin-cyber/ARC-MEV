@@ -40,8 +40,8 @@ cd ARC-MEV
 npm install
 cp .env.example .env            # defaults are safe: DRY_RUN=true
 
-# 1. Discover pools (one-time; resumes if interrupted; ~10 min on the public RPC for the
-#    PoolManager history plus ~5 min for the v3/v2 factories; later runs only scan new blocks)
+# 1. Discover pools (one-time; resumes if interrupted; ~10-15 min for the full history through
+#    DISCOVER_RPC_URL, an archive endpoint; later runs only scan new blocks)
 npm run discover
 
 # 2. Look at the current opportunities once

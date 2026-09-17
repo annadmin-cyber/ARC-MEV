@@ -21,6 +21,9 @@ const optional = <T extends z.ZodTypeAny>(inner: T) => z.preprocess((v) => (v ==
 const schema = z.object({
   CHAIN_ID: z.coerce.number().int().default(5042),
   RPC_URL: z.string().url().default('https://rpc.mainnet.arc.io'),
+  /** JSON-RPC batch size for the main HTTP client; 0 (default) sends single requests. Keep 0 on
+   *  dRPC (rejects batches) and on the official gateway (throttles batch entries). */
+  RPC_BATCH: z.coerce.number().int().min(0).max(100).default(0),
   /** Optional WebSocket endpoint for newHeads; falls back to HTTP polling when absent. */
   WS_URL: optional(z.string().url()),
   /** Extra WebSocket endpoints (comma-separated) whose `newHeads` race with `WS_URL`; heads are de-duplicated by number. */
