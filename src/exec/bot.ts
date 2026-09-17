@@ -216,30 +216,12 @@ export class ArbBot {
     counts.opportunities = opps.length
     const baseFee = await this.baseFeeFor(header)
     const marketTip = this.market.requiredTip()
-    const outbid: Candidate[] = []
-    const candidates = quoteCandidates(cfg, opps, baseFee, MAX_SIMULATIONS, marketTip, outbid)
+    // The market rate is applied after simulation, where the real gas estimate (typically 170-240k for a
+    // 2-hop cycle) decides what the profit affords; at QUOTE_GAS (a deliberately pessimistic 400k) the
+    // pre-filter would call twice as many opportunities unaffordable as actually are.
+    const candidates = quoteCandidates(cfg, opps, baseFee, MAX_SIMULATIONS)
     counts.candidates = candidates.length
     const best = opps[0]
-    if (candidates.length === 0 && outbid.length > 0) {
-      // Worth taking at our price, not at the market's: report it as a would-send instead of paying to lose.
-      const top = outbid[0]!
-      for (const c of outbid) this.stats.onOpportunity(this.opportunityEvent(block, c))
-      this.stats.onDryRun({ block, cycle: describeCycle(top.opp.cycle, this.allInfos), expected18: top.expected18, net18: top.quote.net, reason: 'outbid' })
-      log.info(
-        {
-          block,
-          outbid: outbid.length,
-          cycle: describeCycle(top.opp.cycle, this.allInfos),
-          expectedGrossUsdc: formatUsdc(top.expected18),
-          ourTipGwei: formatFixed(top.quote.maxPriorityFeePerGas, 9, 2),
-          marketTipGwei: formatFixed(marketTip ?? 0n, 9, 2),
-          maxTipShare: cfg.MAX_TIP_SHARE,
-          timing,
-        },
-        'skipping: the market tip exceeds what the profit affords (outbid)',
-      )
-      return
-    }
     if (candidates.length === 0 || !best) {
       // Nothing cleared gas: record the best one so the monitor shows what was close.
       const expected18 = best?.grossProfitUsdc ?? 0n
