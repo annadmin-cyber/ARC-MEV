@@ -3,7 +3,7 @@ import { v2PairAbi, v3PoolAbi } from '../abi/index.js'
 import type { Config } from '../config.js'
 import { ADDRESSES } from '../chains.js'
 import { log } from '../logger.js'
-import { extsload, limiter, type Limiter, type RpcClients } from '../rpc/client.js'
+import { extsload, limiter, type Limiter, type RetryOptions, type RpcClients } from '../rpc/client.js'
 import { aggregate3, type Call3 } from '../rpc/multicall.js'
 import { poolKind, type PoolInfo, type PoolState, type TickData } from '../types.js'
 import {
@@ -32,6 +32,8 @@ export interface FetchPoolStatesOptions {
   tickHints?: ReadonlyMap<Hex, number>
   /** Concurrency limiter for the underlying `extsload` / Multicall3 batches. Default: a limiter of 4. */
   limit?: Limiter
+  /** Retry policy of the underlying `extsload` / Multicall3 batches. Default: the slow `withRetry` defaults. */
+  retry?: RetryOptions
 }
 
 /**
@@ -67,9 +69,9 @@ export async function fetchPoolStates(
     else v2.push(p)
   }
   const [s4, s3, s2] = await Promise.all([
-    v4.length > 0 ? fetchV4States(clients, cfg, v4, block, opts.tickHints, limit) : emptyStates(),
-    v3.length > 0 ? fetchV3States(clients, cfg, v3, block, opts.tickHints, limit) : emptyStates(),
-    v2.length > 0 ? fetchV2States(clients, v2, block, limit) : emptyStates(),
+    v4.length > 0 ? fetchV4States(clients, cfg, v4, block, opts.tickHints, limit, opts.retry) : emptyStates(),
+    v3.length > 0 ? fetchV3States(clients, cfg, v3, block, opts.tickHints, limit, opts.retry) : emptyStates(),
+    v2.length > 0 ? fetchV2States(clients, v2, block, limit, opts.retry) : emptyStates(),
   ])
   for (const p of pools) {
     const s = s4.get(p.poolId) ?? s3.get(p.poolId) ?? s2.get(p.poolId)
@@ -259,11 +261,12 @@ export async function fetchV4States(
   block: bigint,
   tickHints: ReadonlyMap<Hex, number> | undefined,
   limit: Limiter,
+  retry?: RetryOptions,
 ): Promise<Map<Hex, PoolState>> {
   const addresses = ADDRESSES[cfg.CHAIN_ID]
   if (!addresses) throw new Error(`fetchPoolStates: no addresses for chain ${cfg.CHAIN_ID}`)
   const poolManager = addresses.poolManager
-  const read = (slots: Hex[]): Promise<Hex[]> => extsload(clients, poolManager, slots, block, { limit })
+  const read = (slots: Hex[]): Promise<Hex[]> => extsload(clients, poolManager, slots, block, { limit, ...(retry ? { retry } : {}) })
   const backend: TickWindowBackend = {
     async fetchHeads(ps, hintedWords) {
       const slots: Hex[] = []
@@ -327,8 +330,9 @@ export async function fetchV3States(
   block: bigint,
   tickHints: ReadonlyMap<Hex, number> | undefined,
   limit: Limiter,
+  retry?: RetryOptions,
 ): Promise<Map<Hex, PoolState>> {
-  const call = (calls: Call3[]) => aggregate3(clients, calls, block, { limit })
+  const call = (calls: Call3[]) => aggregate3(clients, calls, block, { limit, ...(retry ? { retry } : {}) })
   const backend: TickWindowBackend = {
     async fetchHeads(ps, hintedWords) {
       const calls: Call3[] = []
@@ -382,6 +386,7 @@ export async function fetchV2States(
   pools: readonly PoolInfo[],
   block: bigint,
   limit: Limiter,
+  retry?: RetryOptions,
 ): Promise<Map<Hex, PoolState>> {
   const result = new Map<Hex, PoolState>()
   if (pools.length === 0) return result
@@ -389,7 +394,7 @@ export async function fetchV2States(
     clients,
     pools.map((p) => ({ target: poolAddressOf(p), callData: GET_RESERVES_CALL })),
     block,
-    { limit },
+    { limit, ...(retry ? { retry } : {}) },
   )
   const dropped: Hex[] = []
   pools.forEach((p, i) => {

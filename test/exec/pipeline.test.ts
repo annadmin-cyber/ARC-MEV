@@ -13,6 +13,7 @@ import {
   poolTag,
   quoteCandidates,
   TX_GAS_CAP,
+  capGas,
   withHeadroom,
   type Candidate,
   type SimulatedCandidate,
@@ -114,6 +115,16 @@ describe('quoteCandidates and planning', () => {
     expect(planFor(cfg, simulated(candidate, { ok: true, profit: 1n, gas: 1n, gasSource: 'estimate' }), baseFee)).toBeUndefined()
     const noExecutor = testConfig()
     expect(planFor(noExecutor, simulated(candidate, { ok: true, profit: candidate.opp.grossProfit, gas: 1n, gasSource: 'config' }), baseFee)).toBeUndefined()
+  })
+
+  it('planFor clamps a config gas limit above the chain cap to TX_GAS_CAP', () => {
+    const candidate = quoteCandidates(cfg, opps, baseFee)[0]!
+    const huge = { ...cfg, GAS_LIMIT: 100_000_000 }
+    const plan = planFor(huge, simulated(candidate, { ok: true, profit: candidate.opp.grossProfit, gas: 1n, gasSource: 'config' }), baseFee)
+    expect(plan?.gas).toBe(TX_GAS_CAP)
+    expect(plan?.tx.gas).toBe(TX_GAS_CAP)
+    expect(capGas(TX_GAS_CAP + 1n)).toBe(TX_GAS_CAP)
+    expect(capGas(21_000n)).toBe(21_000n)
   })
 
   it('pickBest chooses the highest net among successful simulations', () => {

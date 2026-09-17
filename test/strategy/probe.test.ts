@@ -212,6 +212,33 @@ describe('HookedProbe', () => {
     expect(probe.price(H1.poolId)?.sqrtPriceX96).toBe(sqrtPriceOf(1.03))
   })
 
+  it('advance() re-reads slot0 for the probe set when the gap exceeds the replay window (swaps in the gap are lost)', async () => {
+    const reserves = new Map([
+      [H1.poolId, { r0: 1_000_000n * E18, r1: 1_000_000n * E18 }],
+      [H2.poolId, { r0: 1_000_000n * E18, r1: 1_000_000n * E18 }],
+    ])
+    const { io } = fakeIo(reserves, { logs: [swapLog(H1.poolId, 601n, sqrtPriceOf(1.02))] })
+    const slot0Reads: bigint[] = []
+    const readSlot0s = io.readSlot0s.bind(io)
+    io.readSlot0s = async (ids, block) => {
+      slot0Reads.push(block)
+      return readSlot0s(ids, block)
+    }
+    const probe = new HookedProbe({ ...SETTINGS, maxReplayBlocks: 20 }, io, TRACKED, [H1, H2], STARTS)
+    await probe.init(600n)
+    expect(slot0Reads).toEqual([600n])
+    expect([...(await probe.advance(610n))]).toEqual([H1.poolId])
+    expect(probe.price(H1.poolId)?.sqrtPriceX96).toBe(sqrtPriceOf(1.02))
+    expect(slot0Reads).toEqual([600n]) // within the window: logs only
+    // Meanwhile the pool moved back to 1:1 in a block the probe will never replay (611..680).
+    const touched = await probe.advance(700n)
+    expect(slot0Reads).toEqual([600n, 700n])
+    expect(probe.price(H1.poolId)?.sqrtPriceX96).toBe(Q96) // re-seeded from slot0, not the stale 1.02
+    expect(probe.price(H1.poolId)?.block).toBe(700)
+    expect([...touched]).toEqual([H1.poolId]) // H2's slot0 did not change: not reported as touched
+    expect(probe.block).toBe(700n)
+  })
+
   it('advance() applies prefetched logs without fetching when they start at or before its resume point', async () => {
     const reserves = new Map([[H1.poolId, { r0: 1_000_000n * E18, r1: 1_000_000n * E18 }]])
     const { io } = fakeIo(reserves, { logs: [swapLog(H1.poolId, 605n, sqrtPriceOf(1.5))] })

@@ -243,6 +243,8 @@ export interface ExtsloadOptions {
   batchSize?: number
   /** Concurrency limiter shared with other readers. Default: module-level limiter of 4. */
   limit?: Limiter
+  /** Retry policy per batch. Default: the slow {@link withRetry} defaults (discovery / backfill); per-block callers pass a short one. */
+  retry?: RetryOptions
 }
 
 /**
@@ -280,7 +282,7 @@ export async function extsload(
             }
             return values as readonly Hex[]
           },
-          { label: `extsload#${idx}` },
+          { ...opts.retry, label: `extsload#${idx}` },
         ),
       ),
     ),

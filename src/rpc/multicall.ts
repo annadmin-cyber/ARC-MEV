@@ -6,7 +6,7 @@
  */
 import { decodeFunctionResult, encodeFunctionData, type Address, type Hex } from 'viem'
 import { multicall3Abi } from '../abi/index.js'
-import { limiter, withRetry, type Limiter, type RpcClients } from './client.js'
+import { limiter, withRetry, type Limiter, type RetryOptions, type RpcClients } from './client.js'
 
 /** Canonical Multicall3 deployment (same address on Arc; see chains.ts). */
 export const MULTICALL3_ADDRESS: Address = '0xca11bde05977b3631167028862be2a173976ca11'
@@ -36,6 +36,8 @@ export interface Aggregate3Options {
   limit?: Limiter
   /** Multicall3 address. Default: the chain definition's `contracts.multicall3`, else the canonical one. */
   multicall?: Address
+  /** Retry policy per batch. Default: the slow `withRetry` defaults (discovery / backfill); per-block callers pass a short one. */
+  retry?: RetryOptions
 }
 
 const defaultLimiter = limiter(4)
@@ -81,7 +83,7 @@ export async function aggregate3(
             }
             return decoded.map((r) => ({ success: r.success, returnData: r.returnData }))
           },
-          { label: `aggregate3#${idx}` },
+          { ...opts.retry, label: `aggregate3#${idx}` },
         ),
       ),
     ),

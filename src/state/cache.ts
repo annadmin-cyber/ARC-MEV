@@ -24,6 +24,13 @@ export type StateFetcher = typeof fetchPoolStates
  */
 export const BLOCK_LOG_RETRY: RetryOptions = { tries: 8, baseMs: 100, factor: 1.6, maxMs: 800 }
 
+/**
+ * Retry policy of the per-block pool refetches (`extsload` / Multicall3 after a liquidity change
+ * or a tick leaving the window): at most ~0.5 s before the block fails and the next head replays
+ * it. The default policy (6 tries, 300 ms doubling) blinded the loop for 9+ s per rate-limit burst.
+ */
+export const BLOCK_REFETCH_RETRY: RetryOptions = { tries: 3, baseMs: 150 }
+
 /** Result of {@link StateCache.applyBlock}. */
 export interface AppliedBlock {
   /** Ids of every pool whose state changed. */
@@ -58,6 +65,8 @@ export interface StateCacheOptions {
   fetchLogs?: BlockLogFetcher
   /** Concurrency limiter shared with other RPC users. */
   limit?: Limiter
+  /** Retry policy of per-block refetches (not of `init`, which keeps the slow default). Default {@link BLOCK_REFETCH_RETRY}. */
+  refetchRetry?: RetryOptions
 }
 
 /** RPC errors that mean "ask again in a moment": the block is not yet served by this node. */
@@ -110,6 +119,7 @@ export class StateCache {
   private readonly fetchStates: StateFetcher
   private readonly fetchLogs: BlockLogFetcher
   private readonly limit: Limiter
+  private readonly refetchRetry: RetryOptions
   private currentBlock: bigint | undefined
   private lastFullRefresh: bigint | undefined
 
@@ -128,6 +138,7 @@ export class StateCache {
     this.maxReplayBlocks = opts.maxReplayBlocks ?? 50
     this.fetchStates = opts.fetchStates ?? fetchPoolStates
     this.limit = opts.limit ?? limiter(4)
+    this.refetchRetry = opts.refetchRetry ?? BLOCK_REFETCH_RETRY
     this.fetchLogs = opts.fetchLogs ?? ((from, to) => this.fetchTrackedLogs(from, to))
   }
 
@@ -184,7 +195,7 @@ export class StateCache {
 
     if (toRefetch.size > 0) {
       const pools = [...toRefetch].map((id) => this.infos.get(id)).filter((p): p is PoolInfo => p !== undefined)
-      await this.refetch(pools, block)
+      await this.refetch(pools, block, this.refetchRetry)
       for (const id of toRefetch) touched.add(id)
       if (toRefetch.size === this.pools.length) this.lastFullRefresh = block
     }
@@ -277,15 +288,18 @@ export class StateCache {
     }
   }
 
-  /** Refetch `pools` at `block`, using the currently cached ticks as bitmap-window hints. */
-  private async refetch(pools: readonly PoolInfo[], block: bigint): Promise<void> {
+  /**
+   * Refetch `pools` at `block`, using the currently cached ticks as bitmap-window hints. `retry`
+   * is the short per-block policy for refetches inside `applyBlock`; `init` leaves it unset.
+   */
+  private async refetch(pools: readonly PoolInfo[], block: bigint, retry?: RetryOptions): Promise<void> {
     if (pools.length === 0) return
     const tickHints = new Map<Hex, number>()
     for (const p of pools) {
       const s = this.states.get(p.poolId)
       if (s) tickHints.set(p.poolId, s.tick)
     }
-    const fresh = await this.fetchStates(this.clients, this.cfg, pools, block, { tickHints, limit: this.limit })
+    const fresh = await this.fetchStates(this.clients, this.cfg, pools, block, { tickHints, limit: this.limit, ...(retry ? { retry } : {}) })
     for (const [id, state] of fresh) this.states.set(id, state)
   }
 

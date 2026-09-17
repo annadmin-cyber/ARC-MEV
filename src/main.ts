@@ -7,6 +7,7 @@
  */
 import { stat } from 'node:fs/promises'
 import { createPublicClient, webSocket, type PublicClient } from 'viem'
+import { getWebSocketRpcClient } from 'viem/utils'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Hex } from 'viem'
 import { loadConfig, type Config } from './config.js'
@@ -25,6 +26,9 @@ import type { PoolInfo } from './types.js'
 
 /** A pool store older than this is reported as stale at startup. */
 const STORE_STALE_MS = 2 * 60 * 60 * 1000
+
+/** Longest a shutdown waits for the receipt of an in-flight transaction. */
+const SHUTDOWN_RECEIPT_WAIT_MS = 10_000
 
 async function main(): Promise<void> {
   const cfg = loadConfig()
@@ -67,7 +71,18 @@ async function main(): Promise<void> {
     log.info({ signal, head: source.status() }, 'shutting down after the current block')
     source.stop()
     await loop.stop()
-    log.info({ lastBlock: loop.lastProcessed }, 'stopped')
+    const inFlight = sender?.inFlight
+    if (sender && inFlight) {
+      // A transaction is still awaiting inclusion: give its receipt a bounded wait so the outcome is logged.
+      log.info({ ...inFlight, waitMs: SHUTDOWN_RECEIPT_WAIT_MS }, 'waiting for the in-flight transaction before exiting')
+      const summary = await sender.waitForReceipt(inFlight.hash, SHUTDOWN_RECEIPT_WAIT_MS).catch((error: unknown) => {
+        log.warn({ err: error, hash: inFlight.hash }, 'receipt wait failed during shutdown')
+        return undefined
+      })
+      if (summary) log.info({ hash: summary.hash, status: summary.status, block: summary.blockNumber, feePaid: summary.feePaid }, 'in-flight transaction settled')
+      else log.warn(inFlight, 'in-flight transaction still unconfirmed at exit')
+    }
+    log.info({ lastBlock: loop.lastProcessed, inFlight: sender?.inFlight ?? null }, 'stopped')
     await exitAfterFlush(0)
   }
   process.once('SIGINT', () => void shutdown('SIGINT'))
@@ -124,6 +139,11 @@ function makeSender(clients: RpcClients, cfg: Config): Sender {
 /**
  * One `newHeads` subscription per configured WebSocket endpoint (`WS_URL` reuses the client
  * `makeClients` built; the extra `WS_URLS` get their own). Empty when none is configured.
+ *
+ * The head source re-creates a subscription that failed or went silent. viem caches one socket
+ * per URL and gives up on it after a few failed reconnects (or keeps a half-dead one after a
+ * silent TCP drop), so every re-create first closes that cached socket: the next request then
+ * opens a fresh connection instead of re-subscribing on a dead one.
  */
 function wsSubscriptions(clients: RpcClients, cfg: Config): HeadSubscription[] {
   return cfg.wsUrls.map((url) => {
@@ -131,11 +151,35 @@ function wsSubscriptions(clients: RpcClients, cfg: Config): HeadSubscription[] {
       url === cfg.WS_URL && clients.ws
         ? clients.ws
         : (createPublicClient({ chain: clients.chain, transport: webSocket(url, { retryCount: 0, timeout: 20_000 }) }) as PublicClient)
+    let attempts = 0
     return {
       url,
-      watch: (onBlock, onError) => client.watchBlockNumber({ emitMissed: false, emitOnBegin: true, onBlockNumber: onBlock, onError }),
+      watch: (onBlock, onError) => {
+        let cancelled = false
+        let unsubscribe: (() => void) | undefined
+        const start = (): void => {
+          if (cancelled) return
+          unsubscribe = client.watchBlockNumber({ emitMissed: false, emitOnBegin: true, onBlockNumber: onBlock, onError })
+        }
+        if (attempts++ === 0) start()
+        else void resetSocket(url).then(start, onError)
+        return () => {
+          cancelled = true
+          unsubscribe?.()
+        }
+      },
     }
   })
+}
+
+/** Close viem's cached socket client for `url` (a no-op connection is opened and closed when none is cached). */
+async function resetSocket(url: string): Promise<void> {
+  try {
+    const rpc = await getWebSocketRpcClient(url)
+    rpc.close()
+  } catch (error) {
+    log.debug({ url, err: error }, 'could not reset the WebSocket before re-subscribing')
+  }
 }
 
 /**

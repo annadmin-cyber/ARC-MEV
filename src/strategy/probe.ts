@@ -347,11 +347,33 @@ export class HookedProbe {
     if (this.lastBlock !== undefined && block <= this.lastBlock) return new Set()
     let from = this.lastBlock === undefined ? block : this.lastBlock + 1n
     const oldest = block - BigInt(this.maxReplayBlocks) + 1n
-    if (from < oldest) from = oldest < 0n ? 0n : oldest
+    const touched = new Set<Hex>()
+    if (from < oldest) {
+      // The gap exceeds the replay window: swaps in the skipped blocks are lost, so re-seed every
+      // probe pool from slot0 at `block` (as in init) rather than keep prices from before the gap.
+      from = oldest < 0n ? 0n : oldest
+      for (const id of await this.reseed(block)) touched.add(id)
+    }
     const logs = prefetched && prefetched.fromBlock <= from ? prefetched.logs : await this.io.fetchSwapLogs(from, block)
-    const touched = this.observeSwapLogs(logs)
+    for (const id of this.observeSwapLogs(logs)) touched.add(id)
     this.lastBlock = block
     return touched
+  }
+
+  /** Re-read `slot0` of every probe pool at `block`; returns the pools whose price changed (or became known). */
+  private async reseed(block: bigint): Promise<Set<Hex>> {
+    const changed = new Set<Hex>()
+    const ids = [...this.probeInfos.keys()]
+    if (ids.length === 0) return changed
+    const snapshots = await this.io.readSlot0s(ids, block)
+    for (const [poolId, s] of snapshots) {
+      if (!this.probeInfos.has(poolId) || s.sqrtPriceX96 <= 0n) continue
+      const previous = this.prices.get(poolId)
+      if (previous?.sqrtPriceX96 !== s.sqrtPriceX96) changed.add(poolId)
+      this.prices.set(poolId, { sqrtPriceX96: s.sqrtPriceX96, tick: s.tick, liquidity: previous?.liquidity ?? 0n, lpFee: s.lpFee, block: Number(block) })
+    }
+    log.warn({ block, lastBlock: this.lastBlock, maxReplayBlocks: this.maxReplayBlocks, reseeded: snapshots.size, changed: changed.size }, 'probe: gap larger than the replay window, prices re-read from slot0')
+    return changed
   }
 
   /**

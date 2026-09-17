@@ -30,7 +30,7 @@ import {
   type SimulatedCandidate,
 } from './pipeline.js'
 import { errorMessage } from './simulate.js'
-import type { Sender } from './sender.js'
+import type { Sender, SendResult } from './sender.js'
 
 /** Every this many blocks all cycles are evaluated, not only those touching pools that changed. */
 export const FULL_EVAL_EVERY = 20
@@ -254,13 +254,28 @@ export class ArbBot {
     const sent = await sender.send(plan.tx, block)
     log.info({ ...details, hash: sent.hash, nonce: sent.nonce, sentTo: sent.sentTo }, 'sent')
     // Do not hold up the block loop for the receipt; the in-flight guard prevents double sends.
-    void sender
-      .waitForReceipt(sent.hash)
-      .then((summary) => this.settle(block, summary))
-      .catch((error: unknown) => {
-        log.warn({ err: error, hash: sent.hash }, 'receipt wait failed')
-        this.settle(block, undefined)
-      })
+    void this.trackOutcome(sender, sent, block)
+  }
+
+  /**
+   * Wait for the receipt of `sent`; when the first wait times out the outcome is unknown, not a
+   * loss, so keep tracking it in the background ({@link Sender.trackReceipt}) and feed the gate
+   * and the gas budget once the transaction is either mined (late receipt) or truly gone.
+   */
+  private async trackOutcome(sender: Sender, sent: SendResult, sentAtBlock: bigint): Promise<void> {
+    try {
+      const summary = await sender.waitForReceipt(sent.hash)
+      if (summary) {
+        this.settle(sentAtBlock, summary)
+        return
+      }
+      log.info({ hash: sent.hash, nonce: sent.nonce, sentAtBlock }, 'receipt outcome unknown, tracking in the background')
+      const outcome = await sender.trackReceipt(sent)
+      this.settle(sentAtBlock, outcome.kind === 'mined' ? outcome.summary : undefined)
+    } catch (error) {
+      log.warn({ err: error, hash: sent.hash }, 'receipt wait failed')
+      this.settle(sentAtBlock, undefined)
+    }
   }
 
   /** Feed a receipt (or its absence) to the breaker and the gas budget. */

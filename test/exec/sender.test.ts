@@ -229,6 +229,53 @@ describe('Sender.waitForReceipt', () => {
     expect(summary?.executed).toBeUndefined()
   })
 
+  it('trackReceipt settles a late receipt as mined (an RPC error or slow inclusion is not a loss)', async () => {
+    let polls = 0
+    let sentHash: Hex | undefined
+    const transport = fakeTransport(async (_url, method, params) => {
+      if (method === 'eth_getTransactionCount') return '0x3'
+      if (method === 'eth_sendRawTransaction') return (sentHash = keccak256(params[0] as Hex))
+      if (method === 'eth_getTransactionReceipt') {
+        polls++
+        if (polls < 4) throw new Error('503 upstream unavailable')
+        return polls < 8 ? null : rawReceipt(sentHash!, '0x1', [executedLog])
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    const sender = new Sender(clients, cfg, account, { transport, receiptPollMs: 5, receiptTimeoutMs: 20 })
+    const sent = await sender.send(TX, 1000n)
+    expect(await sender.waitForReceipt(sent.hash)).toBeUndefined()
+    expect(sender.inFlight?.hash).toBe(sent.hash)
+    const outcome = await sender.trackReceipt(sent)
+    expect(outcome.kind).toBe('mined')
+    if (outcome.kind === 'mined') expect(outcome.summary).toMatchObject({ hash: sent.hash, status: 'success', blockNumber: 1001n, executed: { profit: 123_456n } })
+    expect(sender.inFlight).toBeUndefined()
+    expect(sender.nonce).toBeUndefined()
+  })
+
+  it('trackReceipt reports a loss only once the nonce moved past the tx without a receipt, or at the tracking bound', async () => {
+    let nodeNonce = 3
+    const transport = fakeTransport(async (_url, method, params) => {
+      if (method === 'eth_getTransactionCount') return `0x${nodeNonce.toString(16)}`
+      if (method === 'eth_sendRawTransaction') return keccak256(params[0] as Hex)
+      return null
+    })
+    const sender = new Sender(clients, cfg, account, { transport, receiptPollMs: 5, receiptTimeoutMs: 10, receiptTrackMs: 200 })
+    const sent = await sender.send(TX, 1n)
+    const tracking = sender.trackReceipt(sent)
+    await sleep(30)
+    nodeNonce = 4 // something else consumed nonce 3: the tx can never be mined
+    expect(await tracking).toEqual({ kind: 'lost', reason: 'nonce-advanced' })
+    expect(sender.inFlight).toBeUndefined()
+    expect(sender.nonce).toBeUndefined()
+
+    nodeNonce = 4
+    const sender2 = new Sender(clients, cfg, account, { transport, receiptPollMs: 5, receiptTimeoutMs: 10, receiptTrackMs: 40 })
+    const sent2 = await sender2.send(TX, 2n)
+    expect(await sender2.trackReceipt(sent2)).toEqual({ kind: 'lost', reason: 'timeout' })
+    expect(sender2.inFlight).toBeUndefined()
+  })
+
   it('returns undefined after the timeout and keeps the tx in flight', async () => {
     const transport = fakeTransport(async (_url, method, params) => {
       if (method === 'eth_getTransactionCount') return '0x3'

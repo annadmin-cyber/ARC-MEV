@@ -226,7 +226,7 @@ export function planFor(
   if (!sim.result.ok || !cfg.EXECUTOR_ADDRESS) return undefined
   const decimals = cfg.startCurrencies.get(sim.candidate.opp.cycle.start.toLowerCase() as Address)
   if (decimals === undefined) return undefined
-  const gas = sim.result.gasSource === 'estimate' ? withHeadroom(sim.result.gas) : BigInt(cfg.GAS_LIMIT)
+  const gas = sim.result.gasSource === 'estimate' ? withHeadroom(sim.result.gas) : capGas(BigInt(cfg.GAS_LIMIT))
   const simulatedProfit18 = to18(sim.result.profit, decimals)
   const quote = feePolicy(cfg, baseFee, simulatedProfit18, gas)
   if (!quote || quote.net <= cfg.MIN_PROFIT_USDC_WEI) return undefined
@@ -254,8 +254,12 @@ export function planFor(
 
 /** Estimate + 20 %, capped at the chain's transaction gas cap. */
 export function withHeadroom(estimate: bigint): bigint {
-  const padded = (estimate * GAS_HEADROOM.num) / GAS_HEADROOM.den
-  return padded > TX_GAS_CAP ? TX_GAS_CAP : padded
+  return capGas((estimate * GAS_HEADROOM.num) / GAS_HEADROOM.den)
+}
+
+/** `gas` clamped to the chain's per-transaction gas cap. */
+export function capGas(gas: bigint): bigint {
+  return gas > TX_GAS_CAP ? TX_GAS_CAP : gas
 }
 
 /** `1234567890000000000` -> `"1.234568"` (USDC with 18 decimals, 6 shown). */

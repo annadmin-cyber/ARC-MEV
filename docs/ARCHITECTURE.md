@@ -63,8 +63,10 @@ src/                       TypeScript bot (viem)
 
 1. A new head arrives: every configured WebSocket endpoint's `newHeads` race and are
    de-duplicated by number; a watchdog switches to `eth_blockNumber` polling when no
-   head arrives for `WS_STALL_MS` (and back when heads resume). Without a WebSocket
-   the bot polls every `POLL_INTERVAL_MS`.
+   head arrives for `WS_STALL_MS` (and back when heads resume). A subscription that
+   fails or goes silent is re-created with a capped backoff (2 s doubling to 30 s) and
+   counts as live again on its first head. Without a WebSocket the bot polls every
+   `POLL_INTERVAL_MS`.
 2. `StateCache.applyBlock` fetches the block's logs in **one** `eth_getLogs` with no
    emitter filter and six topic0s (v4 Swap / ModifyLiquidity, v3 Swap / Mint / Burn,
    v2 Sync) and routes each log by emitter: swaps and syncs are applied in place

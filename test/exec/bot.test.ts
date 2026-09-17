@@ -1,17 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createPublicClient, custom, encodeFunctionResult, type Hex, type PublicClient } from 'viem'
+import { createPublicClient, custom, encodeFunctionResult, keccak256, type Hex, type PublicClient } from 'viem'
 import { executorAbi } from '../../src/abi/index.js'
+import { privateKeyToAccount } from 'viem/accounts'
 import { ArbBot } from '../../src/exec/bot.js'
+import { Sender, type SendTransport } from '../../src/exec/sender.js'
 import { clearOperatorCache } from '../../src/exec/simulate.js'
 import { groupCycles } from '../../src/exec/pipeline.js'
-import type { Sender } from '../../src/exec/sender.js'
 import { log } from '../../src/logger.js'
 import type { RpcClients } from '../../src/rpc/client.js'
 import type { RawLog } from '../../src/rpc/logs.js'
 import type { StateCache } from '../../src/state/cache.js'
 import type { HookedProbe, ProbedOpportunity, ProbeResult } from '../../src/strategy/probe.js'
 import type { PoolState } from '../../src/types.js'
-import { CYCLE, EXECUTOR, INFOS, P2, rpcHeader, STATES, TEST_KEY, testConfig } from './helpers.js'
+import { CYCLE, EXECUTOR, INFOS, P2, rpcHeader, STATES, TEST_ADDRESS, TEST_KEY, testConfig } from './helpers.js'
 
 /** Header of every block: extraData announces 130.86 gwei; the profit `execute` reports and the gas estimate. */
 const NEXT_BASE_FEE = 130_864_684_151n
@@ -210,6 +211,60 @@ describe('ArbBot.processBlock', () => {
     expect(warn.mock.calls.some((c) => c[1] === 'would send (circuit breaker paused sending)')).toBe(true)
     await bot.processBlock(22n, 0n)
     expect(sends).toEqual([10n, 11n, 22n])
+  })
+
+  it('does not count a receipt that arrives after the first wait timed out as a loss: the late receipt feeds the gate and the budget', async () => {
+    const live = testConfig({ EXECUTOR_ADDRESS: EXECUTOR, PRIVATE_KEY: TEST_KEY, DRY_RUN: 'false', MAX_CONSECUTIVE_REVERTS: '1', BREAKER_PAUSE_BLOCKS: '10' })
+    const { client } = fakeHttp(defaultHandler())
+    const { cache } = fakeCache(STATES, [P2.poolId])
+    let receiptPolls = 0
+    let sentHash: Hex | undefined
+    const transport: SendTransport = {
+      request: async (_url, method, params) => {
+        if (method === 'eth_getTransactionCount') return '0x3'
+        if (method === 'eth_sendRawTransaction') return (sentHash = keccak256(params[0] as Hex))
+        if (method === 'eth_getTransactionReceipt') {
+          // Nothing for the first ~40 ms (the RPC lags), then a successful receipt in block 41.
+          receiptPolls++
+          if (receiptPolls < 8) return null
+          return {
+            transactionHash: sentHash,
+            transactionIndex: '0x0',
+            blockHash: `0x${'22'.repeat(32)}`,
+            blockNumber: '0x29',
+            from: TEST_ADDRESS,
+            to: EXECUTOR,
+            cumulativeGasUsed: '0x5208',
+            gasUsed: '0x30d40',
+            effectiveGasPrice: '0x2540be400',
+            contractAddress: null,
+            logs: [],
+            logsBloom: `0x${'00'.repeat(256)}`,
+            status: '0x1',
+            type: '0x2',
+          }
+        }
+        throw new Error(`unexpected ${method}`)
+      },
+    }
+    const sender = new Sender({ http: client, sendUrls: [live.RPC_URL] }, live, privateKeyToAccount(TEST_KEY), { transport, receiptPollMs: 5, receiptTimeoutMs: 15 })
+    const warn = vi.spyOn(log, 'warn')
+    const bot = new ArbBot({ clients: { http: client } as RpcClients, cfg: live, cache, infos: INFOS, groups, sender })
+    await bot.processBlock(40n, 0n)
+    expect(sender.inFlight?.sentAtBlock).toBe(40n)
+    // The first receipt wait has timed out (receiptTimeoutMs) but nothing was booked as lost.
+    await new Promise((r) => setTimeout(r, 40))
+    expect(warn.mock.calls.some((c) => c[1] === 'no receipt before timeout (tx still pending or dropped)')).toBe(true)
+    expect(bot.gate.breaker.consecutiveFailures).toBe(0)
+    expect(bot.gate.breaker.tripCount).toBe(0)
+    // The late receipt arrives: success recorded, gas booked, no breaker strike, in-flight cleared.
+    await new Promise((r) => setTimeout(r, 100))
+    expect(receiptPolls).toBeGreaterThanOrEqual(8)
+    expect(bot.gate.breaker.consecutiveFailures).toBe(0)
+    expect(bot.gate.breaker.tripCount).toBe(0)
+    expect(bot.gate.budget.spent(41n)).toBe(200_000n * 10_000_000_000n)
+    expect(sender.inFlight).toBeUndefined()
+    expect(warn.mock.calls.some((c) => c[1] === 'circuit breaker tripped: sending paused')).toBe(false)
   })
 
   it('only dry-runs while the rolling gas budget is exhausted', async () => {

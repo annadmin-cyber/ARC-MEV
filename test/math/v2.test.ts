@@ -112,6 +112,26 @@ describe('v2 derivations', () => {
     expect(v2Tick(0n)).toBe(0)
   })
 
+  it('mirrors ArcArbExecutor.v2SqrtPriceX96: exact mulDiv branch below a 2^64 ratio, quotient of isqrts above it', () => {
+    // reserve1 / reserve0 < 2^64: floor(sqrt(reserve1 * 2^192 / reserve0)), exact.
+    const below = { reserve0: 3n, reserve1: 3n * ((1n << 64n) - 1n) }
+    expect(below.reserve1 / below.reserve0 < 1n << 64n).toBe(true)
+    expect(v2SqrtPriceX96(below)).toBe(isqrt((below.reserve1 << 192n) / below.reserve0))
+    expect(v2SqrtPriceX96({ reserve0: 7n, reserve1: 12345n })).toBe(isqrt((12345n << 192n) / 7n))
+    // reserve1 / reserve0 >= 2^64: the contract's mulDiv would overflow, so it uses (isqrt(r1) << 96) / isqrt(r0).
+    const above = { reserve0: 3n, reserve1: 3n << 64n }
+    expect(above.reserve1 / above.reserve0 >= 1n << 64n).toBe(true)
+    expect(v2SqrtPriceX96(above)).toBe((isqrt(above.reserve1) << 96n) / isqrt(above.reserve0))
+    expect(v2SqrtPriceX96(above)).not.toBe(isqrt((above.reserve1 << 192n) / above.reserve0))
+    const extreme = { reserve0: 1n, reserve1: MAX_UINT112 }
+    expect(v2SqrtPriceX96(extreme)).toBe(isqrt(MAX_UINT112) << 96n)
+    // Both branches agree to within the isqrt rounding at the boundary.
+    const boundary = { reserve0: 1n, reserve1: 1n << 64n }
+    const exact = isqrt((boundary.reserve1 << 192n) / boundary.reserve0)
+    expect(v2SqrtPriceX96(boundary)).toBe((isqrt(boundary.reserve1) << 96n) / isqrt(boundary.reserve0))
+    expect(v2SqrtPriceX96(boundary)).toBe(exact)
+  })
+
   it('clamps the tick at the price bounds and stays inside uint160 for any uint112 reserves', () => {
     expect(v2Tick(MIN_SQRT_PRICE - 1n)).toBe(MIN_TICK)
     expect(v2Tick(MIN_SQRT_PRICE)).toBe(MIN_TICK)

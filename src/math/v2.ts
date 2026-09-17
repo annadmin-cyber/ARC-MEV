@@ -42,10 +42,16 @@ export function getV2AmountOut(amountIn: bigint, reserveIn: bigint, reserveOut: 
   return (amountInWithFee * reserveOut) / (reserveIn * V2_PIPS + amountInWithFee)
 }
 
-/** `sqrt(reserve1 / reserve0) * 2^96` = `isqrt(reserve1 * 2^192 / reserve0)`; 0 for an empty pair. */
+/**
+ * `sqrt(reserve1 / reserve0) * 2^96`, computed exactly as `ArcArbExecutor.v2SqrtPriceX96` does so
+ * the on-chain price guard sees the same number: `isqrt(reserve1 * 2^192 / reserve0)` (exact floor)
+ * while `reserve1 / reserve0 < 2^64` (`mulDiv` would overflow beyond that), otherwise the quotient
+ * of the integer square roots `(isqrt(reserve1) << 96) / isqrt(reserve0)`. 0 for an empty pair.
+ */
 export function v2SqrtPriceX96(reserves: V2Reserves): bigint {
   if (reserves.reserve0 <= 0n || reserves.reserve1 <= 0n) return 0n
-  return isqrt((reserves.reserve1 << 192n) / reserves.reserve0)
+  if (reserves.reserve1 / reserves.reserve0 < 1n << 64n) return isqrt((reserves.reserve1 << 192n) / reserves.reserve0)
+  return (isqrt(reserves.reserve1) << 96n) / isqrt(reserves.reserve0)
 }
 
 /** `isqrt(reserve0 * reserve1)`: the v2 "liquidity" comparable with a full-range v3/v4 position. */

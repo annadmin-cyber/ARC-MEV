@@ -7,9 +7,9 @@ import { poolManagerAbi, v4QuoterAbi } from '../abi/index.js'
 import { ADDRESSES } from '../chains.js'
 import type { Config } from '../config.js'
 import { log } from '../logger.js'
-import { extsload, isRetryableRpcError, sleep, withRetry, type RpcClients } from '../rpc/client.js'
+import { extsload, isRetryableRpcError, sleep, type RpcClients } from '../rpc/client.js'
 import { eventsToTopics, fetchLogsOnce, type RawLog } from '../rpc/logs.js'
-import { isBlockNotReady } from '../state/cache.js'
+import { BLOCK_LOG_RETRY, isBlockNotReady } from '../state/cache.js'
 import { decodeSlot0, slot0Slot } from '../state/slots.js'
 import type { ProbeIo, ProbeSettings, QuoteCall, QuoteCaller, QuoteOutcome, Slot0Snapshot } from '../strategy/probe.js'
 import { errorMessage, revertDataOf } from './simulate.js'
@@ -123,10 +123,11 @@ export function probeIoFor(clients: RpcClients, cfg: Pick<Config, 'CHAIN_ID'>): 
   const topics = eventsToTopics(SWAP_EVENTS)
   return {
     call: quoteCallerFor(clients),
+    /** Per-block path: `fetchLogsOnce` retries itself with the short {@link BLOCK_LOG_RETRY} policy (never nested in another retry). */
     async fetchSwapLogs(fromBlock: bigint, toBlock: bigint): Promise<RawLog[]> {
       for (let attempt = 1; ; attempt++) {
         try {
-          return await withRetry(() => fetchLogsOnce(clients.http, poolManager, topics, fromBlock, toBlock), { label: `probe swap logs ${fromBlock}-${toBlock}` })
+          return await fetchLogsOnce(clients.http, poolManager, topics, fromBlock, toBlock, { ...BLOCK_LOG_RETRY, label: `probe swap logs ${fromBlock}-${toBlock}` })
         } catch (error) {
           if (attempt >= BLOCK_NOT_READY_TRIES || !isBlockNotReady(error)) throw error
           log.debug({ attempt, fromBlock, toBlock }, 'probe: block not yet available for eth_getLogs, retrying')

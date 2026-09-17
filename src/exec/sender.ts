@@ -35,13 +35,13 @@ export interface SendTransport {
 const SEND_TIMEOUT_MS = 5_000
 
 /**
- * Default transport: one viem HTTP client per URL (created lazily, no JSON-RPC batching so a
- * send is never glued to other requests). The primary URL reuses `clients.http`.
+ * Default transport: one dedicated viem HTTP client per URL, the primary one included (created
+ * lazily, no JSON-RPC batching and a short timeout so a send is never glued to other requests
+ * nor held up by the shared client's 20 s timeout).
  */
-export function httpSendTransport(clients: Pick<RpcClients, 'http'>, cfg: Pick<Config, 'RPC_URL'>): SendTransport {
+export function httpSendTransport(): SendTransport {
   const perUrl = new Map<string, PublicClient>()
   const clientFor = (url: string): PublicClient => {
-    if (url === cfg.RPC_URL) return clients.http
     let client = perUrl.get(url)
     if (!client) {
       client = createPublicClient({ transport: http(url, { batch: false, retryCount: 0, timeout: SEND_TIMEOUT_MS }) })
@@ -124,7 +124,19 @@ export interface SenderOptions {
   maxInFlightBlocks?: number
   /** Interval between `eth_getTransactionReceipt` polls in ms. Default 250. */
   receiptPollMs?: number
+  /** How long {@link Sender.waitForReceipt} polls before reporting "unknown" (ms). Default 5000. */
+  receiptTimeoutMs?: number
+  /** Upper bound on {@link Sender.trackReceipt}'s background polling after that (ms). Default 60000. */
+  receiptTrackMs?: number
 }
+
+/** What became of a sent transaction once {@link Sender.trackReceipt} is done with it. */
+export type TrackedOutcome =
+  | { kind: 'mined'; summary: ReceiptSummary }
+  /** The account nonce moved past the transaction without a receipt: it can never be mined. */
+  | { kind: 'lost'; reason: 'nonce-advanced' }
+  /** Still no receipt and the nonce still not consumed when the tracking bound was hit. */
+  | { kind: 'lost'; reason: 'timeout' }
 
 export class Sender {
   readonly address: Address
@@ -132,6 +144,8 @@ export class Sender {
   private readonly urls: string[]
   private readonly maxInFlightBlocks: number
   private readonly receiptPollMs: number
+  private readonly receiptTimeoutMs: number
+  private readonly receiptTrackMs: number
   private nonceValue: number | undefined
   private inFlightTx: InFlight | undefined
 
@@ -142,10 +156,12 @@ export class Sender {
     opts: SenderOptions = {},
   ) {
     this.address = account.address.toLowerCase() as Address
-    this.transport = opts.transport ?? httpSendTransport(clients, cfg)
+    this.transport = opts.transport ?? httpSendTransport()
     this.urls = clients.sendUrls.length > 0 ? [...clients.sendUrls] : [cfg.RPC_URL]
     this.maxInFlightBlocks = opts.maxInFlightBlocks ?? 3
     this.receiptPollMs = opts.receiptPollMs ?? 250
+    this.receiptTimeoutMs = opts.receiptTimeoutMs ?? 5_000
+    this.receiptTrackMs = opts.receiptTrackMs ?? 60_000
   }
 
   /** The next nonce to use, or `undefined` when it must be fetched from the node first. */
@@ -269,11 +285,13 @@ export class Sender {
   }
 
   /**
-   * Poll for the receipt of `hash` for up to `timeoutMs`. On a receipt: log status, gas used,
-   * effective gas price, block and (if emitted) the executor's `Executed` event, clear the
-   * in-flight marker for that hash and schedule a nonce resync. Returns `undefined` on timeout.
+   * Poll for the receipt of `hash` for up to `timeoutMs` (default `receiptTimeoutMs`). On a
+   * receipt: log status, gas used, effective gas price, block and (if emitted) the executor's
+   * `Executed` event, clear the in-flight marker for that hash and schedule a nonce resync.
+   * Returns `undefined` on timeout: the outcome is *unknown* (still pending, an RPC hiccup, or
+   * dropped), not a loss; {@link trackReceipt} settles that.
    */
-  async waitForReceipt(hash: Hex, timeoutMs = 5_000): Promise<ReceiptSummary | undefined> {
+  async waitForReceipt(hash: Hex, timeoutMs = this.receiptTimeoutMs): Promise<ReceiptSummary | undefined> {
     const deadline = Date.now() + timeoutMs
     for (;;) {
       const receipt = await this.fetchReceipt(hash)
@@ -284,6 +302,55 @@ export class Sender {
       }
       await sleep(this.receiptPollMs)
     }
+  }
+
+  /**
+   * After {@link waitForReceipt} gave up: keep polling `tx` in the background until it is
+   * settled. `mined` when a receipt shows up late (RPC errors and slow inclusion are not losses);
+   * `lost` only when the transaction is truly gone: the account nonce on the node has advanced
+   * past `tx.nonce` without a receipt for `tx.hash` (something else consumed the nonce, e.g. the
+   * re-send after `maxInFlightBlocks`), or `receiptTrackMs` elapsed with the nonce still unused.
+   */
+  async trackReceipt(tx: Pick<InFlight, 'hash' | 'nonce'>): Promise<TrackedOutcome> {
+    const deadline = Date.now() + this.receiptTrackMs
+    for (;;) {
+      const receipt = await this.fetchReceipt(tx.hash)
+      if (receipt) return { kind: 'mined', summary: this.onReceipt(receipt) }
+      const count = await this.fetchNonce()
+      if (count !== undefined && count > tx.nonce) {
+        // The nonce is consumed; if it was by this tx the receipt is just behind: look once more.
+        const late = await this.fetchReceipt(tx.hash)
+        if (late) return { kind: 'mined', summary: this.onReceipt(late) }
+        log.warn({ hash: tx.hash, nonce: tx.nonce, nodeNonce: count }, 'transaction lost: its nonce was consumed by another transaction')
+        this.forget(tx.hash)
+        return { kind: 'lost', reason: 'nonce-advanced' }
+      }
+      if (Date.now() >= deadline) {
+        log.warn({ hash: tx.hash, nonce: tx.nonce, nodeNonce: count, trackMs: this.receiptTrackMs }, 'transaction lost: no receipt and nonce unused after the tracking bound')
+        this.forget(tx.hash)
+        return { kind: 'lost', reason: 'timeout' }
+      }
+      await sleep(this.receiptPollMs)
+    }
+  }
+
+  /** `eth_getTransactionCount(latest)` of the bot's account, `undefined` when the call fails. */
+  private async fetchNonce(): Promise<number | undefined> {
+    try {
+      const raw = await this.transport.request(this.primaryUrl, 'eth_getTransactionCount', [this.address, 'latest'])
+      const nonce = Number(BigInt(raw as string))
+      return Number.isSafeInteger(nonce) && nonce >= 0 ? nonce : undefined
+    } catch (error) {
+      log.debug({ err: errorMessage(error) }, 'eth_getTransactionCount failed, will retry')
+      return undefined
+    }
+  }
+
+  /** Drop the in-flight marker for `hash` (a lost transaction) and resync the nonce before the next send. */
+  private forget(hash: Hex): void {
+    if (this.inFlightTx?.hash !== hash) return
+    this.inFlightTx = undefined
+    this.nonceValue = undefined
   }
 
   private async fetchReceipt(hash: Hex): Promise<TransactionReceipt | undefined> {

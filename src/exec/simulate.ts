@@ -179,20 +179,45 @@ export function describeRevert(error: unknown): string {
 /**
  * Extract the revert data carried by a JSON-RPC error, wherever the transport put it: viem's
  * `RpcRequestError.data` (a hex string, or an object with a `data` field on some providers) at
- * any depth of the `cause` chain, or a hex blob embedded in the message as a last resort.
+ * any depth of the `cause` chain, or, as a last resort, a hex blob embedded in the node's message
+ * anywhere along the chain (viem keeps it in `details`; the raw JSON-RPC error object at the end
+ * of the chain carries it as `message`). Some nodes answer `execution reverted: 0x…` with no
+ * `data` field at all, so without the message pass the executor's error would go undecoded.
  */
 export function revertDataOf(error: unknown): Hex | undefined {
+  const chain = errorChainOf(error)
+  for (const e of chain) {
+    const hex = hexIn((e as { data?: unknown }).data)
+    if (hex !== undefined) return hex
+  }
+  for (const e of chain) {
+    // A viem error's `message` also quotes the request (calldata, addresses), so only its `details`
+    // (the node's message) is searched; plain errors and raw JSON-RPC error objects use `message`.
+    const text = e instanceof BaseError ? e.details : (e as { message?: unknown }).message
+    const match = typeof text === 'string' ? HEX_IN_TEXT.exec(text) : null
+    if (match) return match[0] as Hex
+  }
+  if (typeof error === 'string') {
+    const match = HEX_IN_TEXT.exec(error)
+    if (match) return match[0] as Hex
+  }
+  return undefined
+}
+
+/** A hex blob of at least four bytes (a selector) inside free text. */
+const HEX_IN_TEXT = /0x[0-9a-fA-F]{8,}/
+
+/** `error` followed by its `cause`s (viem nests several levels deep), cycle-safe. */
+function errorChainOf(error: unknown): object[] {
+  const out: object[] = []
   const seen = new Set<unknown>()
   let current: unknown = error
   while (current !== null && typeof current === 'object' && !seen.has(current)) {
     seen.add(current)
-    const data = (current as { data?: unknown }).data
-    const hex = hexIn(data)
-    if (hex !== undefined) return hex
+    out.push(current)
     current = (current as { cause?: unknown }).cause
   }
-  const match = /0x[0-9a-fA-F]{8,}/.exec(errorMessage(error))
-  return match ? (match[0] as Hex) : undefined
+  return out
 }
 
 /** A hex string directly, or the `data` field of an object (`{ data: "0x..." }`). */
@@ -202,9 +227,16 @@ function hexIn(value: unknown): Hex | undefined {
   return undefined
 }
 
-/** Short one-line message for any thrown value. */
+/**
+ * Short one-line message for any thrown value. For a viem error the node's own message
+ * (`details`) is appended to viem's generic `shortMessage` when it adds information, so an
+ * `execution reverted: …` answer is never reduced to "Missing or invalid parameters.".
+ */
 export function errorMessage(error: unknown): string {
-  if (error instanceof BaseError) return error.shortMessage
+  if (error instanceof BaseError) {
+    const details = error.details?.trim()
+    return details && details !== error.shortMessage ? `${error.shortMessage} (${details})` : error.shortMessage
+  }
   if (error instanceof Error) return error.message
   return String(error)
 }

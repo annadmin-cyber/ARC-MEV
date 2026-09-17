@@ -15,20 +15,22 @@ const bool = (def: string) =>
     .string()
     .default(def)
     .transform((s) => ['1', 'true', 'yes', 'on'].includes(s.toLowerCase()))
+/** dotenv parses `KEY=` (a common way to leave a setting unset) as the empty string: treat it as absent. */
+const optional = <T extends z.ZodTypeAny>(inner: T) => z.preprocess((v) => (v === '' ? undefined : v), inner.optional())
 
 const schema = z.object({
   CHAIN_ID: z.coerce.number().int().default(5042),
   RPC_URL: z.string().url().default('https://rpc.mainnet.arc.io'),
   /** Optional WebSocket endpoint for newHeads; falls back to HTTP polling when absent. */
-  WS_URL: z.string().url().optional(),
+  WS_URL: optional(z.string().url()),
   /** Extra WebSocket endpoints (comma-separated) whose `newHeads` race with `WS_URL`; heads are de-duplicated by number. */
   WS_URLS: z.string().default(''),
   /** No head over WebSocket for this many ms -> fall back to HTTP polling until heads resume. */
   WS_STALL_MS: z.coerce.number().int().min(100).default(3000),
   /** Bot hot key. Only needed when DRY_RUN=false. */
-  PRIVATE_KEY: hex.optional(),
+  PRIVATE_KEY: optional(hex),
   /** Deployed ArcArbExecutor. Only needed for on-chain simulation and sending. */
-  EXECUTOR_ADDRESS: address.optional(),
+  EXECUTOR_ADDRESS: optional(address),
 
   DRY_RUN: bool('true'),
   /** Minimum net profit (after gas) in USDC wei (18 decimals). Default 0.15 USDC: on launch day 16% of
@@ -53,8 +55,9 @@ const schema = z.object({
   SEND_RPC_URLS: z.string().default(''),
   /** sqrtPrice tolerance (bps) for on-chain state guards; 0 disables guards. */
   GUARD_TOLERANCE_BPS: z.coerce.number().int().min(0).default(1),
-  /** Upper bound on the gas limit of execute() transactions (used when estimation fails). */
-  GAS_LIMIT: z.coerce.number().int().default(1_500_000),
+  /** Upper bound on the gas limit of execute() transactions (used when estimation fails). Bounded by the
+   *  intrinsic gas of a transaction and the chain's per-transaction gas cap (`TX_GAS_CAP`). */
+  GAS_LIMIT: z.coerce.number().int().min(21_000).max(16_777_216).default(1_500_000),
   /** Gas assumed when quoting profitability before an on-chain estimate exists. A 2-hop v4 cycle
    *  uses ~250-350k gas; keep this close to reality or good opportunities are rejected early. */
   QUOTE_GAS: z.coerce.number().int().min(21_000).default(400_000),
