@@ -123,6 +123,24 @@ been tested; the contract is exercised only by its Foundry tests.
 - Executor calldata is byte-identical to Solidity `abi.encodeCall` for a v4-only and a mixed
   v4 + v3 + v2 plan (checked-in vectors).
 
+- The executor went through an adversarial review (four independent reviewers, every finding
+  re-verified with Foundry tests). One critical issue was found and fixed before any deployment: the
+  v3-style callback used to pay whatever the calling pool demanded, so a stolen operator key could
+  have drained profit held in the contract through a hostile pool. Payments are now bound to the hop's
+  own input currency and amount. The regression tests live in `contracts/test/review/`.
+- The TypeScript hot path was reviewed the same way (nonce handling, unit conversions, calldata
+  against the contract, log routing, resume points, the block loop); no money-losing defect was found,
+  and the robustness findings (WebSocket re-subscription, retry stalls, receipt accounting) were fixed.
+
+## What the numbers look like
+
+Measured from receipts on launch day (`docs/ARC_RESEARCH.md`): arbitrage bots netted about 6,000 USDC
+in the busiest hour and ~2,800 USDC/h since launch, but the median winning transaction nets 0.13 USDC,
+the top 10% of transactions make 87% of the profit, the top five operators take 62%, and 16% of "wins"
+lost money to their own gas. The steadiest bot never bids for the top of the block. Expect tens of USDC
+per hour at best from a fresh bot unless it wins a tail event. The defaults (0.15 USDC minimum profit,
+30% of profit as tip, 100–5,000 gwei tips, 5 USDC/h gas budget) are set from those numbers.
+
 ## Risks you should understand
 
 - **Losing races costs gas.** There are no bundles or revert protection on Arc. If another bot
