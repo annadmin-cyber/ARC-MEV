@@ -31,20 +31,24 @@ const schema = z.object({
   EXECUTOR_ADDRESS: address.optional(),
 
   DRY_RUN: bool('true'),
-  /** Minimum net profit (after gas) in USDC wei (18 decimals). Default 0.05 USDC. */
-  MIN_PROFIT_USDC_WEI: bigintStr('50000000000000000'),
+  /** Minimum net profit (after gas) in USDC wei (18 decimals). Default 0.15 USDC: on launch day 16% of
+   *  winning arbs were net-negative after their own fee, and the median win netted 0.13 USDC. */
+  MIN_PROFIT_USDC_WEI: bigintStr('150000000000000000'),
   /** Largest input the optimizer may try, in USDC wei. Default 5,000 USDC. */
   MAX_INPUT_USDC_WEI: bigintStr('5000000000000000000000'),
   /** Multiply the estimated gas cost by this before comparing to profit. */
   GAS_SAFETY: z.coerce.number().default(1.5),
   /** Hard cap on maxFeePerGas in wei. Arc base fee floats (floor 20 gwei, cap 20,000 gwei). Default 25,000 gwei. */
   MAX_FEE_PER_GAS_WEI: bigintStr('25000000000000'),
-  /** Priority fee budget as a fraction of expected gross profit (0.5 = bid up to 50% of profit). */
-  TIP_SHARE: z.coerce.number().min(0).max(1).default(0.5),
-  /** Hard cap on maxPriorityFeePerGas in wei. Top-of-block tips on Arc are ~350 gwei p50, ~6000 gwei p90. Default 10,000 gwei. */
-  MAX_PRIORITY_FEE_WEI: bigintStr('10000000000000'),
-  /** Minimum priority fee in wei (below this the tx sorts behind everyone). Default 25 gwei. */
-  MIN_PRIORITY_FEE_WEI: bigintStr('25000000000'),
+  /** Priority fee budget as a fraction of expected gross profit. Winners on launch day paid ~6.6% of
+   *  gross at the median for 1-10 USDC arbs and slot-0 winners out-bid the best loser 4.8x, so 0.3 is
+   *  plenty; 62% of profitable arbs landed at position 5 or later. */
+  TIP_SHARE: z.coerce.number().min(0).max(1).default(0.3),
+  /** Hard cap on maxPriorityFeePerGas in wei. Slot-0 tips were ~210-330 gwei p50; bids above ~5,000 gwei
+   *  were irrational outliers. Default 5,000 gwei. */
+  MAX_PRIORITY_FEE_WEI: bigintStr('5000000000000'),
+  /** Minimum priority fee in wei. Default 100 gwei (p75 of what lands). */
+  MIN_PRIORITY_FEE_WEI: bigintStr('100000000000'),
   /** Extra RPC URLs (comma-separated) that also receive eth_sendRawTransaction, for latency fan-out. */
   SEND_RPC_URLS: z.string().default(''),
   /** sqrtPrice tolerance (bps) for on-chain state guards; 0 disables guards. */

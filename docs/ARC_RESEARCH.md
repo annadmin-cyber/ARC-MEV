@@ -154,6 +154,31 @@ These notes drive the design decisions in `ARCHITECTURE.md`.
 - EURC `0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1`, USYC `0x8a5D989Bbb96929F689B0200f435f53dA42bF490`.
 - CCTP v2 TokenMessengerV2 `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d` (domain 26) for bridging USDC in.
 
+## What arbitrage actually earned on launch day (on-chain receipts, block window 21,175,300–21,181,299)
+
+- 3,458 arbitrage transactions in 0.84 h. Swap-log gross 10,025 USDC, but hooks with
+  `afterSwapReturnsDelta` took 1,850 USDC after the Swap event, so bots received 6,709 USDC; fees
+  765 USDC; **net 5,944 USDC/0.84 h**. Since launch the median minute nets ~47 USDC (~2.8k USDC/h);
+  two single transactions (1,554 and 661 USDC) dominate the tail.
+- Per-transaction net: median 0.13 USDC, p90 2.0, p99 27.8. The top 1% of transactions make 58% of the
+  profit, the top 10% make 87%. 16% of "wins" were net-negative after their own fee.
+- Top-5 operators take 62%. The best risk-adjusted bot (`0x0d437351…`) never bids for slot 0: 20 gwei
+  tip, zero reverts, lands at position 5 or later, 567 USDC in the window. Two aggressive bots burned
+  164 and 290 USDC on reverts (6% and 5% win rates, ~440k gas per revert).
+- **74% of net involves a hooked v4 leg.** The largest category is the same launch token quoted in
+  native USDC on launchpad (aka.fun) pools versus ERC-20-USDC pools, bridged through the native/ERC-20
+  USDC pools `0xc8a1b341…` (999/1) and `0xdaddf3b9…`. Then other-hook v4 pools, hookless v4 only
+  (585 USDC), DYORSwap v2 vs v4 (537), market-maker hooks, v3 vs v4 (100 USDC over 403 arbs). The
+  institutional pairs (USDC/EURC, cirBTC/USDC, CRCL/USDC) were 4% of profit and are taken within
+  10 blocks. Aero CL: under 2 USDC.
+- Winners' tips: p50 6.6% of gross for 1–10 USDC arbs, 0.3% above 10 USDC; slot-0 winners out-bid the
+  best loser 4.8x at the median. 62% of profitable arbs landed at position 5 or later and 30% in the
+  same block as the imbalancing swap.
+- Sizing matters: arbs with at least 100 USDC input made 67% of net; the largest used 5,383 USDC of
+  flash-accounted input.
+- Trigger signal: the launchpad/aggregator routers `0x9689992f…`, `0x53dea4f7…`, `0x0ae42971…` and
+  `0x00000000e91f…` create the imbalances with their slot-0 buys.
+
 ## Latency map and the inclusion window (measured from a US-East sandbox through a proxy)
 
 | Endpoint | Read RTT (med) | Send RTT | `newHeads` |

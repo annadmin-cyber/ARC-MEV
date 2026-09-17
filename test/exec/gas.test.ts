@@ -6,15 +6,18 @@ import { rpcHeader, testConfig } from './helpers.js'
 
 const GWEI = 1_000_000_000n
 const USDC = 10n ** 18n
-const cfg = testConfig()
+// The arithmetic cases below pin explicit fee parameters so they do not drift with the defaults.
+const cfg = testConfig({ TIP_SHARE: '0.5', MIN_PRIORITY_FEE_WEI: '25000000000', MAX_PRIORITY_FEE_WEI: '10000000000000' })
 
 describe('feePolicy', () => {
-  it('uses the defaults: TIP_SHARE 0.5, 25 gwei floor, 10000 gwei tip cap, 25000 gwei fee cap, safety 1.5', () => {
-    expect(cfg.TIP_SHARE).toBe(0.5)
-    expect(cfg.MIN_PRIORITY_FEE_WEI).toBe(25n * GWEI)
-    expect(cfg.MAX_PRIORITY_FEE_WEI).toBe(10_000n * GWEI)
-    expect(cfg.MAX_FEE_PER_GAS_WEI).toBe(25_000n * GWEI)
-    expect(cfg.GAS_SAFETY).toBe(1.5)
+  it('ships defaults tuned to launch-day economics: TIP_SHARE 0.3, 100 gwei floor, 5000 gwei tip cap, 25000 gwei fee cap, 0.15 USDC min profit', () => {
+    const defaults = testConfig()
+    expect(defaults.TIP_SHARE).toBe(0.3)
+    expect(defaults.MIN_PRIORITY_FEE_WEI).toBe(100n * GWEI)
+    expect(defaults.MAX_PRIORITY_FEE_WEI).toBe(5_000n * GWEI)
+    expect(defaults.MAX_FEE_PER_GAS_WEI).toBe(25_000n * GWEI)
+    expect(defaults.GAS_SAFETY).toBe(1.5)
+    expect(defaults.MIN_PROFIT_USDC_WEI).toBe(15n * 10n ** 16n)
   })
 
   it('bids TIP_SHARE of the profit per gas unit and prices the transaction', () => {
