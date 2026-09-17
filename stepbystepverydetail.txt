@@ -1,0 +1,591 @@
+ARC-MEV  —  VERY DETAILED STEP-BY-STEP GUIDE
+=============================================
+
+This guide takes you from an empty computer to a running arbitrage bot on Arc
+(Circle's stablecoin chain, chain id 5042). It assumes you have never run a bot
+before. Follow the steps in order. Steps 0–7 cost nothing and need no keys.
+Only steps 8–13 involve real money.
+
+Read the whole guide once before starting.
+
+
+--------------------------------------------------------------------------
+PART 0  —  WHAT THIS BOT DOES (2 minutes)
+--------------------------------------------------------------------------
+
+- Arc has no public mempool, so "sandwich" bots (jaredfromsubway style) are
+  impossible. Nobody can see a trade before it lands.
+- What works: after every block (~0.5 s), prices on different pools drift apart.
+  The bot spots the gap and sends ONE transaction that buys on the cheap pool
+  and sells on the expensive one, all inside a single atomic call. If the gap
+  is gone by the time it lands, the transaction reverts before any swap and
+  only a little gas is lost.
+- The bot needs NO trading capital. The swaps are funded by Uniswap v4 flash
+  accounting and a flash loan from the PoolManager inside the same
+  transaction. You only pay gas. Gas on Arc is USDC.
+- Profit collects inside a smart contract (the "executor") that only your
+  cold "owner" key can withdraw from. The bot's hot "operator" key can only
+  trigger arbitrages; it cannot take the profit.
+- Realistic expectations, measured on launch day: the median winning arb nets
+  about 0.13 USDC, a few big ones make most of the money, and 16% of "wins"
+  lost money to gas. Plan for tens of USDC per hour at best. This is a
+  competitive game. Do not put in money you cannot afford to spend on gas.
+
+
+--------------------------------------------------------------------------
+PART 1  —  INSTALL THE TOOLS
+--------------------------------------------------------------------------
+
+You need a computer (or a cheap cloud VM) that is on 24/7. A Linux VM in
+US-East (Virginia) is best because Arc's RPC gateway is served from there.
+1 vCPU / 2 GB RAM is enough. Ubuntu 22.04 or 24.04 is assumed below.
+macOS works the same. On Windows install WSL2 (Ubuntu) and do everything
+inside it.
+
+1.1  Update the system and install git + curl + build tools
+
+    sudo apt update && sudo apt install -y git curl build-essential
+
+1.2  Install Node.js 22 (the bot needs 22 or newer)
+
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    sudo apt install -y nodejs
+    node --version        # must print v22.x.x or higher
+    npm --version
+
+    (macOS: brew install node@22)
+
+1.3  Install Foundry (only needed to deploy the contract and to sweep profit)
+
+    curl -L https://foundry.paradigm.xyz | bash
+    source ~/.bashrc          # or open a new terminal
+    foundryup
+    forge --version           # prints a version
+    cast --version
+
+    If foundryup fails to download, get the tarball directly:
+    https://github.com/foundry-rs/foundry/releases  (foundry_stable_linux_amd64.tar.gz),
+    extract it to ~/.foundry/bin and add that directory to your PATH.
+
+
+--------------------------------------------------------------------------
+PART 2  —  GET THE CODE
+--------------------------------------------------------------------------
+
+2.1  Clone the repository WITH submodules (the contract depends on Uniswap's
+     source code which is pulled in as git submodules)
+
+    git clone --recurse-submodules https://github.com/annadmin-cyber/ARC-MEV
+    cd ARC-MEV
+    git checkout claude/zen-hawking-0xq2kh
+    git submodule update --init --recursive
+
+2.2  Install the JavaScript dependencies
+
+    npm install
+
+    This takes 20–60 seconds. Warnings about "npm notice" are fine.
+
+2.3  Create your configuration file from the template
+
+    cp .env.example .env
+
+    The defaults are SAFE: DRY_RUN=true means the bot never sends anything.
+    Open .env in any text editor (nano .env) and read the comments once.
+
+2.4  Check that everything compiles and the tests pass (optional, 1 minute)
+
+    npm run typecheck
+    npm test                    # about 340 tests, all should pass
+    cd contracts && forge test && cd ..     # 62 contract tests
+
+
+--------------------------------------------------------------------------
+PART 3  —  DISCOVER THE POOLS (no keys, no money)
+--------------------------------------------------------------------------
+
+The bot needs a list of every pool on Arc. This is built once and updated
+incrementally afterwards.
+
+3.1  Run discovery
+
+    npm run discover
+
+    What happens: it scans the Uniswap v4 PoolManager history from block
+    1,948,056, then the Uniswap v3 and v2 / DYORSwap factories, reads the
+    liquidity of every pool, and counts recent swaps. On the public RPC this
+    takes roughly 10–15 minutes the first time. It saves progress every
+    100,000 blocks, so if it is interrupted just run it again and it resumes.
+
+3.2  What you should see at the end
+
+    A summary like:
+      pools: 33646, with liquidity: 20254, hookless with liquidity: 7170,
+      active (last 3000 blocks): 2550, tracked: 571
+
+    The file data/pools.5042.json now exists. Do not edit it by hand.
+
+3.3  Keep it fresh
+
+    Arc creates about one new pool per block. Re-run "npm run discover" once
+    a day (it only scans the new blocks, about 15 seconds). The bot warns you
+    at start-up if the file is older than 2 hours.
+
+Troubleshooting:
+  - "rate limit exceeded" / "Request exceeds defined limit." lines: normal on
+    the public RPC, the scanner retries automatically.
+  - If it keeps failing, put a different endpoint in .env:
+      RPC_URL=https://rpc.drpc.mainnet.arc.io
+
+
+--------------------------------------------------------------------------
+PART 4  —  LOOK AT OPPORTUNITIES ONCE
+--------------------------------------------------------------------------
+
+4.1  Run a one-shot scan
+
+    npm run scan
+
+    It fetches the state of all tracked pools at the current block, evaluates
+    every 2-hop and 3-hop cycle, probes the hooked pools through Uniswap's
+    on-chain quoter, and prints a table of the best opportunities with:
+      cycle (which pools), amountIn, gross profit, net profit after gas,
+      whether it came from the probe, and the kinds (v4 / v3 / v2).
+    At the bottom it prints the next block's base fee.
+
+4.2  How to read it
+
+    - "no profitable cycle at block N" is the NORMAL state most of the time.
+    - A net profit below the MIN_PROFIT_USDC_WEI setting (default 0.15 USDC)
+      would not be sent by the bot.
+    - Most opportunities on Arc are tiny memecoin pools with 70–90% fees.
+      That is expected.
+
+
+--------------------------------------------------------------------------
+PART 5  —  RUN THE BOT IN DRY-RUN MODE
+--------------------------------------------------------------------------
+
+5.1  Start it with verbose logs
+
+    LOG_LEVEL=debug npm run bot
+
+5.2  What you should see
+
+    - "starting" with chainId 5042, dryRun true
+    - "state cache initialised" and "probe: initialised"
+    - "following the head via newHeads" (if WS_URL is set) or polling
+    - one line per block with timings:  logs / eval / probe / sim / send (ms)
+    - occasionally "would send (DRY_RUN)" or "opportunities found but none
+      clears gas + MIN_PROFIT"
+
+    Healthy numbers: "logs" p50 under ~150 ms, blocks arriving roughly twice
+    per second, no repeated error lines.
+
+5.3  Stop it
+
+    Press Ctrl-C once. It finishes the current block and prints "stopped".
+
+5.4  Let it run for at least 30 minutes before going further, so you get a
+     feel for how often anything clears the profit bar.
+
+
+--------------------------------------------------------------------------
+PART 6  —  TURN ON THE LIVE MONITOR (recommended)
+--------------------------------------------------------------------------
+
+6.1  In .env set
+
+    MONITOR_PORT=3000
+
+6.2  Start the bot again. The log prints:  live monitor listening url=http://127.0.0.1:3000
+
+6.3  Open http://127.0.0.1:3000 in a browser ON THE SAME MACHINE.
+
+    If the bot runs on a server, tunnel the port from your laptop:
+
+    ssh -L 3000:127.0.0.1:3000 youruser@your-server-ip
+
+    then open http://localhost:3000 on the laptop.
+
+6.4  What the page shows (auto-refreshes every 2 s)
+
+    - header: chain, DRY RUN / LIVE, head feed mode (ws / polling), executor,
+      tracked and probed pools, cycles
+    - tiles: profit, gas paid, net (today / hour / total), sends with
+      won / reverted / lost, win rate, "would send" counts, blocks per minute,
+      last block, uptime
+    - gate: circuit breaker state and gas budget bar
+    - latency table per stage (this tells you if your RPC is too slow)
+    - last opportunities and last sends (hashes link to explorer.arc.io)
+
+    Also:  http://127.0.0.1:3000/api/status  (JSON)
+           http://127.0.0.1:3000/metrics     (Prometheus, for Grafana)
+
+
+--------------------------------------------------------------------------
+PART 7  —  CHOOSE YOUR RPC ENDPOINTS
+--------------------------------------------------------------------------
+
+Measured on launch day. Put these in .env:
+
+    WS_URL=wss://rpc.mainnet.arc.io/ws
+    RPC_URL=https://rpc.blockdaemon.mainnet.arc.io
+    SEND_RPC_URLS=https://rpc.mainnet.arc.io,https://rpc.blockdaemon.mainnet.arc.io
+
+Why:
+  - The official WebSocket delivers new blocks first (87% of the time).
+  - The official HTTP endpoint lags its own WebSocket by ~300 ms and
+    rate-limits hard, so reads go to Blockdaemon (or dRPC:
+    https://rpc.drpc.mainnet.arc.io).
+  - Sends go to both the gateway (fastest) and Blockdaemon (no rate limit).
+
+Optional: a paid key from QuickNode, Alchemy, Blockdaemon or dRPC gives you
+more headroom. Put its HTTPS URL in RPC_URL and its WSS URL in WS_URL.
+
+If you stay on the public gateway only, lower the probe load:
+    PROBE_MAX_PER_BLOCK=1
+    PROBE_GRID=3
+
+
+--------------------------------------------------------------------------
+PART 8  —  CREATE YOUR KEYS  (money starts here)
+--------------------------------------------------------------------------
+
+You need TWO brand-new wallets. Never reuse a wallet that holds other funds.
+
+8.1  Generate them
+
+    cast wallet new      # first run  -> this is the OWNER  (cold key)
+    cast wallet new      # second run -> this is the OPERATOR (hot key)
+
+    Each prints an Address and a Private key.
+
+8.2  Store them
+
+    - OWNER private key: write it down / password manager. It will hold the
+      profit. It is NEVER placed on the bot server.
+    - OPERATOR private key: goes into the bot's .env on the server. It only
+      ever holds a little gas money. If it is stolen the thief can waste your
+      gas but cannot take the profit from the executor.
+
+8.3  Never paste a private key into chat, screenshots or GitHub.
+     .env is listed in .gitignore, so git will not upload it.
+
+
+--------------------------------------------------------------------------
+PART 9  —  FUND THE WALLETS WITH USDC ON ARC
+--------------------------------------------------------------------------
+
+On Arc, USDC IS the native coin. The same balance pays gas and is what you
+trade. There is no ETH.
+
+9.1  Add Arc to your wallet app (MetaMask / Rabby / etc.)
+
+    Network name:     Arc
+    Chain ID:         5042
+    RPC URL:          https://rpc.mainnet.arc.io
+    Currency symbol:  USDC
+    Block explorer:   https://explorer.arc.io
+
+9.2  Bridge USDC in with Circle's CCTP
+
+    From Ethereum, Base, Arbitrum, Solana, etc. use Circle's bridge
+    (https://www.circle.com/cross-chain-transfer-protocol or any wallet /
+    app that offers "CCTP to Arc"). The Arc destination is CCTP domain 26.
+    Some exchanges may support withdrawing directly to Arc; check first.
+
+9.3  How much
+
+    - OPERATOR address:  20–50 USDC to start (deploy cost ~0.5 USDC plus gas
+      for hours of running at the default 5 USDC/hour budget). Top up to
+      ~100 USDC once you trust it. Never keep more than a few days of gas
+      there.
+    - OWNER address:  ~1 USDC (only to pay gas when sweeping profit; it will
+      also pay the deployment if you deploy from it, so give it ~2 USDC).
+
+9.4  Verify the balances
+
+    cast balance 0xYourOperatorAddress --rpc-url https://rpc.mainnet.arc.io
+    (prints wei with 18 decimals: 20 USDC = 20000000000000000000)
+
+    Note: your wallet may also show USDC as an ERC-20 token at
+    0x3600000000000000000000000000000000000000 with 6 decimals. That is the
+    SAME balance seen two ways, not extra money.
+
+
+--------------------------------------------------------------------------
+PART 10  —  DEPLOY THE EXECUTOR CONTRACT
+--------------------------------------------------------------------------
+
+10.1  Build it
+
+    cd contracts
+    forge build
+
+10.2  Deploy it (costs about 0.3–0.6 USDC of gas, paid by the key you sign
+      with; using the OWNER key is fine)
+
+    OWNER=0xYourOwnerAddress OPERATOR=0xYourOperatorAddress \
+    forge script script/Deploy.s.sol \
+      --rpc-url https://rpc.mainnet.arc.io \
+      --private-key 0xYOUR_OWNER_PRIVATE_KEY \
+      --broadcast
+
+    It first simulates, then broadcasts, then prints:
+      ArcArbExecutor deployed at 0x....
+      poolManager 0x8366a39CC670B4001A1121B8F6A443A643e40951
+      owner       0xYourOwnerAddress
+      operator    0xYourOperatorAddress
+
+    COPY the "deployed at" address. Then:  cd ..
+
+10.3  Verify it on chain
+
+    cast call 0xEXECUTOR "owner()(address)"    --rpc-url https://rpc.mainnet.arc.io
+    cast call 0xEXECUTOR "operator()(address)" --rpc-url https://rpc.mainnet.arc.io
+
+    Both must print your addresses. If the operator is wrong, fix it from the
+    owner key:
+    cast send 0xEXECUTOR "setOperator(address)" 0xOperator \
+      --rpc-url https://rpc.mainnet.arc.io --private-key 0xOWNER_KEY
+
+    (Mainnet explorer source verification is blocked by Cloudflare; the
+    contract still works unverified.)
+
+
+--------------------------------------------------------------------------
+PART 11  —  CONFIGURE FOR LIVE TRADING
+--------------------------------------------------------------------------
+
+11.1  Edit .env on the bot machine:
+
+    EXECUTOR_ADDRESS=0xEXECUTOR            # from step 10.2
+    PRIVATE_KEY=0xOPERATOR_PRIVATE_KEY     # the HOT key, never the owner
+    WS_URL=wss://rpc.mainnet.arc.io/ws
+    RPC_URL=https://rpc.blockdaemon.mainnet.arc.io
+    SEND_RPC_URLS=https://rpc.mainnet.arc.io,https://rpc.blockdaemon.mainnet.arc.io
+    MONITOR_PORT=3000
+
+    Start conservative:
+    MAX_INPUT_USDC_WEI=500000000000000000000     # 500 USDC max per trade
+    MIN_PROFIT_USDC_WEI=150000000000000000       # 0.15 USDC (default)
+    GAS_BUDGET_USDC_WEI=5000000000000000000      # 5 USDC per hour (default)
+
+    Leave DRY_RUN=true for the moment.
+
+11.2  Test the live configuration WITHOUT sending
+
+    npm run scan
+
+    With EXECUTOR_ADDRESS set, every printed opportunity is now also
+    simulated on-chain through YOUR contract (eth_call). "simulated: ok"
+    rows prove the deployment, the operator key and the RPC are correct.
+    Rows that say "NotOperator" mean the operator address is wrong (10.3).
+
+11.3  Run the bot once more in dry-run with the live settings
+
+    npm run bot
+
+    Confirm "executor 0x..." appears in the monitor header and that
+    "would send (DRY_RUN)" lines contain "simulated" profits.
+
+11.4  Flip the switch
+
+    In .env:   DRY_RUN=false
+
+
+--------------------------------------------------------------------------
+PART 12  —  RUN IT FOR REAL, AND KEEP IT RUNNING
+--------------------------------------------------------------------------
+
+12.1  First live run, in the foreground, and watch it
+
+    npm run bot
+
+    In the monitor you will now see "LIVE". Watch the "last sends" table:
+      outcome mined + profit  -> a win (profit is now inside the executor)
+      reverted               -> you lost the race; you paid only the small
+                                guard gas (usually < 0.03 USDC)
+      lost                   -> never mined within the tracking window
+
+    Built-in brakes you do not have to configure:
+      - one transaction in flight at a time
+      - circuit breaker: after 3 consecutive reverted/lost sends it pauses
+        sending for 120 blocks (~1 minute)
+      - gas budget: after 5 USDC of gas in an hour it stops sending until
+        enough spending rolls out of the window
+
+12.2  Run it as a service so it survives reboots and crashes
+
+    Option A: pm2 (easy)
+      sudo npm install -g pm2
+      pm2 start npm --name arc-mev -- run bot
+      pm2 logs arc-mev
+      pm2 save && pm2 startup       # follow the printed command once
+
+    Option B: systemd
+      sudo tee /etc/systemd/system/arc-mev.service >/dev/null <<EOF
+      [Unit]
+      Description=ARC-MEV bot
+      After=network-online.target
+      [Service]
+      WorkingDirectory=/home/YOURUSER/ARC-MEV
+      ExecStart=/usr/bin/npm run bot
+      Restart=always
+      RestartSec=5
+      User=YOURUSER
+      Environment=LOG_PRETTY=false
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now arc-mev
+      journalctl -u arc-mev -f
+
+12.3  Daily routine
+
+    - Look at the monitor: net today, win rate, reverts, latency p90.
+    - Re-run discovery once a day:  npm run discover   (restart the bot after)
+    - Check the operator balance; top up before it drops below ~5 USDC.
+
+12.4  Tuning knobs (change one at a time, watch for an hour)
+
+    TIP_SHARE               0.3 default; how much of expected profit to bid
+                            as priority fee. Higher = more wins, lower margin.
+    MIN_PRIORITY_FEE_WEI    100 gwei default floor.
+    MAX_PRIORITY_FEE_WEI    5000 gwei default cap.
+    MIN_PROFIT_USDC_WEI     raise it if you see many tiny wins that barely
+                            cover reverts.
+    MAX_INPUT_USDC_WEI      raise once comfortable; bigger arbs make most of
+                            the money and are still flash-funded.
+    MAX_TRACKED_POOLS       300 default; more pools = more cycles but slower
+                            blocks. Keep "logs" p90 under ~250 ms.
+    PROBE_MAX_PER_BLOCK     hooked-pool quotes per block (RPC cost).
+
+
+--------------------------------------------------------------------------
+PART 13  —  COLLECT YOUR PROFIT
+--------------------------------------------------------------------------
+
+Profit accumulates in the executor contract in two possible forms of USDC
+(they are the same money, just two views).
+
+13.1  See how much is there
+
+    cast balance 0xEXECUTOR --rpc-url https://rpc.mainnet.arc.io
+    (18-decimal wei; 1 USDC = 1000000000000000000)
+
+13.2  Sweep everything to the owner (run from a machine with the OWNER key)
+
+    # ERC-20 view (6 decimals)
+    cast send 0xEXECUTOR "sweep(address,address)" \
+      0x3600000000000000000000000000000000000000 0xYourOwnerAddress \
+      --rpc-url https://rpc.mainnet.arc.io --private-key 0xOWNER_KEY
+
+    # native view (18 decimals) — usually only dust remains here
+    cast send 0xEXECUTOR "sweep(address,address)" \
+      0x0000000000000000000000000000000000000000 0xYourOwnerAddress \
+      --rpc-url https://rpc.mainnet.arc.io --private-key 0xOWNER_KEY
+
+    Both calls move the same underlying balance; after the first one the
+    second may have nothing left to sweep, which is fine.
+
+13.3  Partial withdrawal
+
+    cast send 0xEXECUTOR "withdraw(address,address,uint256)" \
+      0x3600000000000000000000000000000000000000 0xOwner 25000000 \
+      --rpc-url https://rpc.mainnet.arc.io --private-key 0xOWNER_KEY
+    (25000000 = 25 USDC in 6-decimal units)
+
+
+--------------------------------------------------------------------------
+PART 14  —  EMERGENCY STOPS
+--------------------------------------------------------------------------
+
+- Stop sending immediately:      set DRY_RUN=true in .env and restart the bot
+                                 (pm2 restart arc-mev / systemctl restart arc-mev)
+- Stop the process:              pm2 stop arc-mev  /  systemctl stop arc-mev
+- Disable the hot key on chain (if the server is compromised), from the OWNER key:
+    cast send 0xEXECUTOR "setOperator(address)" \
+      0x0000000000000000000000000000000000000000 \
+      --rpc-url https://rpc.mainnet.arc.io --private-key 0xOWNER_KEY
+- Move profit out (13.2). The owner key alone controls it.
+- Rotate the hot key: generate a new operator (8.1), fund it, setOperator to
+  the new address, update PRIVATE_KEY in .env, restart.
+
+
+--------------------------------------------------------------------------
+PART 15  —  TROUBLESHOOTING
+--------------------------------------------------------------------------
+
+"PRIVATE_KEY is required when DRY_RUN=false"
+    You set DRY_RUN=false without PRIVATE_KEY / EXECUTOR_ADDRESS.
+
+"NotOperator" in simulation results
+    The executor's operator is not the PRIVATE_KEY address. Fix with
+    setOperator from the owner key (10.3).
+
+"pool store is stale (> 2h)"
+    Run npm run discover, then restart.
+
+Head mode stuck on "polling"
+    WS_URL missing or unreachable. Use wss://rpc.mainnet.arc.io/ws. The bot
+    re-subscribes automatically after drops; polling is only the fallback.
+
+"Request exceeds defined limit." / rate limit lines
+    The public gateway is throttling. Move reads to Blockdaemon or dRPC
+    (Part 7), lower PROBE_MAX_PER_BLOCK, or get a keyed endpoint.
+
+"could not read the block header, falling back"
+    Your read endpoint had not seen the block yet. Harmless; it uses the
+    previous base fee estimate.
+
+Many reverts in a row
+    You are losing races. Lower MAX_TRACKED_POOLS (faster blocks), move the
+    server to US-East, or raise TIP_SHARE a little. The breaker already
+    protects you from bleeding.
+
+Bot exits with an error at start
+    Read the first "error" line. Most common: malformed .env value (an address
+    without 0x, a number with decimals). Numbers in .env are integers in wei.
+
+Contract shows profit but sweep reverts
+    Make sure you sign with the OWNER key and that the destination address is
+    not the zero address. Native transfers to address(0) revert on Arc.
+
+
+--------------------------------------------------------------------------
+PART 16  —  UPDATING THE BOT
+--------------------------------------------------------------------------
+
+    cd ARC-MEV
+    git pull
+    git submodule update --init --recursive
+    npm install
+    npm run typecheck && npm test
+    pm2 restart arc-mev        # or systemctl restart arc-mev
+
+If the contract changed (contracts/src/ArcArbExecutor.sol), re-deploy (Part
+10), sweep the old executor first (Part 13), and update EXECUTOR_ADDRESS.
+
+
+--------------------------------------------------------------------------
+QUICK REFERENCE
+--------------------------------------------------------------------------
+
+Chain id            5042
+RPC                 https://rpc.mainnet.arc.io
+WebSocket           wss://rpc.mainnet.arc.io/ws
+Explorer            https://explorer.arc.io
+USDC (ERC-20 view)  0x3600000000000000000000000000000000000000  (6 decimals)
+USDC (native view)  address 0x000...000, 18 decimals, pays gas
+Uniswap v4 PoolManager  0x8366a39CC670B4001A1121B8F6A443A643e40951
+CCTP domain         26
+
+Commands
+  npm run discover   build/refresh the pool list
+  npm run scan       one-shot look at opportunities
+  npm run bot        run the bot (DRY_RUN controls sending)
+  npm run typecheck  / npm test        checks
+  cd contracts && forge test           contract tests
