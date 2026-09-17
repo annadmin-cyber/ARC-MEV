@@ -142,7 +142,7 @@ export async function readNextBaseFee(clients: Pick<RpcClients, 'http'>, block?:
       const header = await withRetry(
         () => (block === undefined ? clients.http.getBlock({ blockTag: 'latest', includeTransactions: false }) : clients.http.getBlock({ blockNumber: block, includeTransactions: false })),
         // Per-block path: a short policy, the slow default would hold the block loop for 9+ s.
-        { label, tries: 2, baseMs: 100 },
+        { label, tries: 3, baseMs: 120 },
       )
       const parsed = parseNextBaseFee(header)
       if (parsed.source === 'fallback') log.debug({ block: header.number, extraData: header.extraData }, 'header extraData is not an 8-byte base fee, using +12.5% estimate')

@@ -84,8 +84,9 @@ src/                       TypeScript bot (viem)
 4. Probe: for every touched hooked pool (or touched tracked pool on its pair) whose
    spot price differs from a tracked pool's by more than `PROBE_MIN_SPREAD_BPS`, the
    profitable-looking 2-hop cycle through both is quoted at `PROBE_GRID` log-spaced
-   inputs in one JSON-RPC batch of `V4Quoter.quoteExactInput` calls (the hooked hop
-   on chain, the tracked hop locally), refined once, and merged into the ranking.
+   inputs, all `V4Quoter.quoteExactInput` calls of a round packed into one `Multicall3.aggregate3`
+   `eth_call` (`PROBE_QUOTE_MODE`; the hooked hop on chain, the tracked hop locally), refined once,
+   and merged into the ranking.
    At most `PROBE_MAX_PER_BLOCK` pairs per block, most-spread first.
 5. Opportunities are ranked in 18-decimal USDC (one per pool), priced against the
    next base fee and `QUOTE_GAS`, and the top three are simulated on chain with
@@ -149,9 +150,15 @@ small (only pools with liquidity), and prefer a provider endpoint over the publi
 RPC, which is rate limited at roughly 10 requests/s ("Request exceeds defined
 limit." / HTTP 429 / -32005). Measured in dry-run on the public gateway with 571
 tracked pools (547 v4, 21 v3, 3 v2) and 62 probed hooked pools: the log fetch takes
-~80-250 ms per block, a probe batch ~150-250 ms, and every quoter `eth_call` counts
-against the limit, so with the default probe budget (up to 4 pairs x 5 grid points
-x 2 batches per block) the loop falls to every second or third block; with
-`PROBE_MAX_PER_BLOCK=1 PROBE_GRID=3` it keeps up with consecutive blocks most of the
-time. Rate-limited quoter calls are re-issued once or twice with short waits, and the
-per-block log fetch retries briefly and otherwise lets the next head replay the gap.
+~80-250 ms per block and a probe round ~150-250 ms. With `PROBE_QUOTE_MODE=batch`
+every quoter `eth_call` counts against the limit (gateways rate-limit each entry of a
+JSON-RPC batch, and cap batches at 3-100 per provider), so with the default probe
+budget (up to 4 pairs x 5 grid points x 2 rounds per block) the loop falls to every
+second or third block; with `PROBE_MAX_PER_BLOCK=1 PROBE_GRID=3` it keeps up with
+consecutive blocks most of the time. The default `PROBE_QUOTE_MODE=multicall` packs
+a round's quotes into one `Multicall3.aggregate3` `eth_call` (split above 150 quotes),
+so a round is one request whatever the grid: the quoter's own reverts
+(`NotEnoughLiquidity`, `UnexpectedRevertBytes`) come back per sub-call with
+`success=false` and are decoded as in batch mode. Rate-limited quoter calls are
+re-issued once or twice with short waits, and the per-block log fetch retries briefly
+and otherwise lets the next head replay the gap.

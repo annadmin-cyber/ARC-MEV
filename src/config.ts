@@ -88,8 +88,12 @@ const schema = z.object({
   PROBE_MAX_PER_BLOCK: z.coerce.number().int().min(0).default(4),
   /** A hooked pool is probed only when its spot price differs from a tracked pool's by more than this (bps). */
   PROBE_MIN_SPREAD_BPS: z.coerce.number().int().min(0).default(30),
-  /** Log-spaced input amounts quoted per probed cycle (one JSON-RPC batch); a refinement pass follows. */
+  /** Log-spaced input amounts quoted per probed cycle (one quoter round); a refinement pass follows. */
   PROBE_GRID: z.coerce.number().int().min(2).default(5),
+  /** How a block's quoter calls reach the node: `multicall` packs them into one `Multicall3.aggregate3`
+   *  `eth_call` (one request whatever the grid; works on every provider), `batch` issues one `eth_call`
+   *  per quote in JSON-RPC batches of 20 (the previous behaviour; gateways rate-limit every entry). */
+  PROBE_QUOTE_MODE: z.enum(['multicall', 'batch']).default('multicall'),
 
   /** After this many consecutive reverted or lost transactions, stop sending for BREAKER_PAUSE_BLOCKS. */
   MAX_CONSECUTIVE_REVERTS: z.coerce.number().int().min(1).default(3),

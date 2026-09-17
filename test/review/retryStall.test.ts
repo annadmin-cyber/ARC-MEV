@@ -111,7 +111,7 @@ describe('retry policies on the per-block critical path', () => {
     expect(fetchStates.mock.calls[1]?.[4]?.retry).toBe(BLOCK_REFETCH_RETRY)
   })
 
-  it('readNextBaseFee gives a rate-limited header read one quick retry only', async () => {
+  it('readNextBaseFee gives a rate-limited header read two quick retries only', async () => {
     let attempts = 0
     const client = createPublicClient({
       transport: custom(
@@ -126,7 +126,7 @@ describe('retry policies on the per-block critical path', () => {
     }) as PublicClient
     const { result, elapsedMs } = await settle(readNextBaseFee({ http: client }, 100n))
     expect(result.status).toBe('rejected')
-    expect(attempts).toBe(2)
-    expect(elapsedMs).toBeLessThan(500)
+    expect(attempts).toBe(3)
+    expect(elapsedMs).toBeLessThan(900)
   })
 })
