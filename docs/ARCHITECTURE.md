@@ -99,9 +99,13 @@ src/                       TypeScript bot (viem)
    next base fee and `QUOTE_GAS`, and the top three are simulated on chain with
    `eth_call` of `execute` at the same block (then `eth_estimateGas`). Anything that
    reverts or does not clear `MIN_PROFIT_USDC_WEI` after `GAS_SAFETY` x gas is dropped.
-6. The best survivor is sent as an EIP-1559 transaction (tip = `TIP_SHARE` of the
-   expected profit, clamped) with `minProfit` and price guards set on chain, so a
-   stale opportunity reverts before swapping. One in-flight transaction per block;
+6. The best survivor is sent as an EIP-1559 transaction with `minProfit` and price guards
+   set on chain, so a stale opportunity reverts before swapping. The tip is `TIP_SHARE`
+   of the expected profit, raised to the market rate (the `MARKET_TIP_QUANTILE` of the
+   last `MARKET_TIP_BLOCKS` blocks' top tips, read from the headers the loop already
+   fetches, times `MARKET_TIP_MARGIN`) while `MAX_TIP_SHARE` of the profit affords it;
+   an opportunity that cannot afford the market rate is skipped as "outbid" rather than
+   sent to land behind the competition and revert for its tip. One in-flight transaction per block;
    the circuit breaker (`MAX_CONSECUTIVE_REVERTS`) and the rolling gas budget
    (`GAS_BUDGET_USDC_WEI` per `GAS_BUDGET_WINDOW_BLOCKS`) can turn sending off.
    In `DRY_RUN` the plan is logged instead.

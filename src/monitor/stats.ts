@@ -8,6 +8,7 @@
  */
 import { formatUnits } from 'viem'
 import type { HeadSourceStatus } from '../exec/headSource.js'
+import type { MarketSnapshot } from '../exec/market.js'
 
 /** Milliseconds per stage of one block; `probe` is absent when no probe ran. */
 export interface StageTimings {
@@ -72,7 +73,7 @@ export interface LostEvent {
 }
 
 /** Why a plan that would have been sent was not. */
-export type WouldSendReason = 'dry-run' | 'no-executor' | 'breaker' | 'gas-budget' | 'in-flight'
+export type WouldSendReason = 'dry-run' | 'no-executor' | 'breaker' | 'gas-budget' | 'in-flight' | 'outbid'
 
 export interface DryRunEvent {
   block: bigint
@@ -172,6 +173,14 @@ export interface StatsSnapshot {
     budgetLimit: Money
     budgetUsedPct: number
     windowBlocks: number
+  } | null
+  /** Going rate for block position: top-tip quantiles of recent blocks and the tip a send must bid. */
+  market: {
+    blocks: number
+    p50: GasPrice | null
+    p75: GasPrice | null
+    p90: GasPrice | null
+    required: GasPrice | null
   } | null
   probe: {
     rounds: number
@@ -298,7 +307,7 @@ export class BotStats {
 
   private opportunities = 0
   private candidates = 0
-  private wouldSend: Record<WouldSendReason, number> = { 'dry-run': 0, 'no-executor': 0, breaker: 0, 'gas-budget': 0, 'in-flight': 0 }
+  private wouldSend: Record<WouldSendReason, number> = { 'dry-run': 0, 'no-executor': 0, breaker: 0, 'gas-budget': 0, 'in-flight': 0, outbid: 0 }
   private sends = 0
   private wins = 0
   private reverts = 0
@@ -311,6 +320,7 @@ export class BotStats {
 
   private head: HeadSourceStatus | undefined
   private gate: GateStatus | undefined
+  private market: MarketSnapshot | undefined
   private staticInfo: StaticInfo | undefined
   private probeRounds = 0
   private probeCalls = 0
@@ -415,6 +425,10 @@ export class BotStats {
     this.gate = { ...gate }
   }
 
+  setMarket(market: MarketSnapshot): void {
+    this.market = { ...market }
+  }
+
   // ---- read side ----
 
   /** Percentiles per stage over the ring buffer. */
@@ -501,6 +515,15 @@ export class BotStats {
             budgetLimit: money(gate.budgetLimit18),
             budgetUsedPct: gate.budgetLimit18 <= 0n ? 100 : Math.min(100, Number((gate.budgetSpent18 * 10_000n) / gate.budgetLimit18) / 100),
             windowBlocks: gate.windowBlocks,
+          }
+        : null,
+      market: this.market
+        ? {
+            blocks: this.market.blocks,
+            p50: this.market.p50 === null ? null : gasPrice(this.market.p50),
+            p75: this.market.p75 === null ? null : gasPrice(this.market.p75),
+            p90: this.market.p90 === null ? null : gasPrice(this.market.p90),
+            required: this.market.required === null ? null : gasPrice(this.market.required),
           }
         : null,
       probe: {

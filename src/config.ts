@@ -49,9 +49,23 @@ const schema = z.object({
    *  gross at the median for 1-10 USDC arbs and slot-0 winners out-bid the best loser 4.8x, so 0.3 is
    *  plenty; 62% of profitable arbs landed at position 5 or later. */
   TIP_SHARE: z.coerce.number().min(0).max(1).default(0.3),
-  /** Hard cap on maxPriorityFeePerGas in wei. Slot-0 tips were ~210-330 gwei p50; bids above ~5,000 gwei
-   *  were irrational outliers. Default 5,000 gwei. */
-  MAX_PRIORITY_FEE_WEI: bigintStr('5000000000000'),
+  /** Hard cap on maxPriorityFeePerGas in wei. Slot-0 tips were ~210-330 gwei p50 on launch day, but by
+   *  day two the bots taking 1-2 USDC arbs paid 3,000-13,000 gwei. Default 15,000 gwei; the market gate
+   *  and MAX_TIP_SHARE decide whether such a bid is affordable for a given opportunity. */
+  MAX_PRIORITY_FEE_WEI: bigintStr('15000000000000'),
+  /** Largest share of the expected gross profit the tip may consume when the market rate is above the
+   *  TIP_SHARE bid. Beyond it the opportunity is skipped as "outbid" instead of sent to lose. Default 0.8. */
+  MAX_TIP_SHARE: z.coerce.number().min(0).max(1).default(0.8),
+  /** Market tip gate: each block header's transactions reveal the tip the block's winner paid. The gate
+   *  requires a send's tip to be at least MARKET_TIP_QUANTILE of the top tips of the last
+   *  MARKET_TIP_BLOCKS blocks times MARKET_TIP_MARGIN (raising the bid while MAX_TIP_SHARE affords it,
+   *  skipping otherwise). false = bid TIP_SHARE only, as before. */
+  MARKET_TIP_GATE: bool('true'),
+  MARKET_TIP_BLOCKS: z.coerce.number().int().min(1).max(10_000).default(120),
+  /** Live sample (day two, quiet minute): top tips p50 40 gwei, p75 146, p90 830; contested blocks are the
+   *  top decile, so 0.9 tracks them while lower quantiles only see the quiet blocks. */
+  MARKET_TIP_QUANTILE: z.coerce.number().min(0).max(1).default(0.9),
+  MARKET_TIP_MARGIN: z.coerce.number().min(0).default(1.25),
   /** Minimum priority fee in wei. Default 100 gwei (p75 of what lands). */
   MIN_PRIORITY_FEE_WEI: bigintStr('100000000000'),
   /** Extra RPC URLs (comma-separated) that also receive eth_sendRawTransaction, for latency fan-out. */

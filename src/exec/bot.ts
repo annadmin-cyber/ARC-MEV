@@ -17,6 +17,7 @@ import { rankOpportunities, to18, type EvaluatedOpportunity, type HookedProbe, t
 import { poolKind, type PoolInfo, type PoolState } from '../types.js'
 import { SendGate } from './breaker.js'
 import { feePolicy, readBaseFee, readNextBaseFee, type NextBaseFee } from './gas.js'
+import { TipMarket } from './market.js'
 import {
   boundsByStart,
   describeCycle,
@@ -100,7 +101,11 @@ export class ArbBot {
     this.bounds = boundsByStart(deps.cfg)
     this.gate = deps.gate ?? new SendGate(deps.cfg)
     this.stats = deps.stats ?? new BotStats()
+    this.market = new TipMarket(deps.cfg)
   }
+
+  /** Top tips of recent blocks: the going rate for block position (see {@link TipMarket}). */
+  readonly market: TipMarket
 
   /** The gate's state as of `block`, for the monitor. */
   gateStatus(block: bigint): GateStatus {
@@ -154,6 +159,10 @@ export class ArbBot {
         return undefined
       }),
     ])
+    if (header) {
+      this.market.record(header.block, header.topTips[0])
+      this.stats.setMarket(this.market.snapshot())
+    }
     let touchedHooked = new Set<Hex>()
     if (probe) {
       try {
@@ -206,9 +215,31 @@ export class ArbBot {
 
     counts.opportunities = opps.length
     const baseFee = await this.baseFeeFor(header)
-    const candidates = quoteCandidates(cfg, opps, baseFee, MAX_SIMULATIONS)
+    const marketTip = this.market.requiredTip()
+    const outbid: Candidate[] = []
+    const candidates = quoteCandidates(cfg, opps, baseFee, MAX_SIMULATIONS, marketTip, outbid)
     counts.candidates = candidates.length
     const best = opps[0]
+    if (candidates.length === 0 && outbid.length > 0) {
+      // Worth taking at our price, not at the market's: report it as a would-send instead of paying to lose.
+      const top = outbid[0]!
+      for (const c of outbid) this.stats.onOpportunity(this.opportunityEvent(block, c))
+      this.stats.onDryRun({ block, cycle: describeCycle(top.opp.cycle, this.allInfos), expected18: top.expected18, net18: top.quote.net, reason: 'outbid' })
+      log.info(
+        {
+          block,
+          outbid: outbid.length,
+          cycle: describeCycle(top.opp.cycle, this.allInfos),
+          expectedGrossUsdc: formatUsdc(top.expected18),
+          ourTipGwei: formatFixed(top.quote.maxPriorityFeePerGas, 9, 2),
+          marketTipGwei: formatFixed(marketTip ?? 0n, 9, 2),
+          maxTipShare: cfg.MAX_TIP_SHARE,
+          timing,
+        },
+        'skipping: the market tip exceeds what the profit affords (outbid)',
+      )
+      return
+    }
     if (candidates.length === 0 || !best) {
       // Nothing cleared gas: record the best one so the monitor shows what was close.
       const expected18 = best?.grossProfitUsdc ?? 0n
@@ -255,12 +286,29 @@ export class ArbBot {
     const simulated = await simulateCandidates(clients, cfg, candidates, states as Map<Hex, PoolState>, this.allInfos, block)
     timing.sim = elapsed(tSim)
     for (const sim of simulated) this.stats.onOpportunity(this.opportunityEvent(block, sim.candidate, sim))
-    const plan = pickBest(cfg, simulated, baseFee)
+    const plan = pickBest(cfg, simulated, baseFee, marketTip)
     if (!plan) {
       log.info({ block, candidates: simulated.map((s) => this.summariseSim(s)), timing }, 'candidates rejected by on-chain simulation')
       return
     }
 
+    if (plan.quote.outbid) {
+      // The simulated profit (or the estimated gas) no longer affords the market rate.
+      this.stats.onDryRun({ block, cycle: describeCycle(plan.candidate.opp.cycle, this.allInfos), expected18: plan.simulatedProfit18, net18: plan.quote.net, reason: 'outbid' })
+      log.info(
+        {
+          block,
+          cycle: describeCycle(plan.candidate.opp.cycle, this.allInfos),
+          simulatedGrossUsdc: formatUsdc(plan.simulatedProfit18),
+          gas: plan.gas,
+          ourTipGwei: formatFixed(plan.quote.maxPriorityFeePerGas, 9, 2),
+          marketTipGwei: formatFixed(marketTip ?? 0n, 9, 2),
+          timing,
+        },
+        'skipping after simulation: the market tip exceeds what the profit affords (outbid)',
+      )
+      return
+    }
     const tSend = performance.now()
     await this.act(plan, block)
     timing.send = elapsed(tSend)
@@ -291,6 +339,7 @@ export class ArbBot {
       gasSource: plan.gasSource,
       maxFeeGwei: formatFixed(plan.quote.maxFeePerGas, 9, 2),
       tipGwei: formatFixed(plan.quote.maxPriorityFeePerGas, 9, 2),
+      marketTipGwei: plan.quote.marketTip === undefined ? undefined : formatFixed(plan.quote.marketTip, 9, 2),
       gasCostUsdc: formatUsdc(plan.quote.gasCost),
       guards: plan.guards.length,
       truncated: opp.truncated,

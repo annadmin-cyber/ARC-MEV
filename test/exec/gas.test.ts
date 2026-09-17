@@ -10,11 +10,13 @@ const USDC = 10n ** 18n
 const cfg = testConfig({ TIP_SHARE: '0.5', MIN_PRIORITY_FEE_WEI: '25000000000', MAX_PRIORITY_FEE_WEI: '10000000000000' })
 
 describe('feePolicy', () => {
-  it('ships defaults tuned to launch-day economics: TIP_SHARE 0.3, 100 gwei floor, 5000 gwei tip cap, 25000 gwei fee cap, 0.15 USDC min profit', () => {
+  it('ships defaults tuned to measured economics: TIP_SHARE 0.3, 100 gwei floor, 15000 gwei tip cap, 25000 gwei fee cap, 0.15 USDC min profit', () => {
     const defaults = testConfig()
     expect(defaults.TIP_SHARE).toBe(0.3)
     expect(defaults.MIN_PRIORITY_FEE_WEI).toBe(100n * GWEI)
-    expect(defaults.MAX_PRIORITY_FEE_WEI).toBe(5_000n * GWEI)
+    expect(defaults.MAX_PRIORITY_FEE_WEI).toBe(15_000n * GWEI)
+    expect(defaults.MAX_TIP_SHARE).toBe(0.8)
+    expect(defaults.MARKET_TIP_GATE).toBe(true)
     expect(defaults.MAX_FEE_PER_GAS_WEI).toBe(25_000n * GWEI)
     expect(defaults.GAS_SAFETY).toBe(1.5)
     expect(defaults.MIN_PROFIT_USDC_WEI).toBe(15n * 10n ** 16n)
@@ -97,7 +99,7 @@ describe('readNextBaseFee', () => {
 
   it('parses the 8-byte big-endian extraData as the next base fee', () => {
     const parsed = parseNextBaseFee(ARC_HEADER)
-    expect(parsed).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData' })
+    expect(parsed).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData', topTips: [] })
     expect(formatFixed(parsed.nextBaseFee, 9, 2)).toBe('130.86')
   })
 
@@ -126,8 +128,9 @@ describe('readNextBaseFee', () => {
       ),
     }) as PublicClient
     const fee = await readNextBaseFee({ http: client }, 21_112_099n)
-    expect(fee).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData' })
+    expect(fee).toEqual({ nextBaseFee: 130_864_684_151n, baseFee: 121_598_711_914n, block: 21_112_099n, source: 'extraData', topTips: [] })
     expect(attempts).toBe(3)
-    expect(calls[0]).toEqual(['eth_getBlockByNumber', ['0x1422523', false]])
+    // Transactions ride along (their tips feed the TipMarket) at no extra request.
+    expect(calls[0]).toEqual(['eth_getBlockByNumber', ['0x1422523', true]])
   })
 })

@@ -169,7 +169,7 @@ function render(s){
    +tile('Net today',signed(s.net.today),'total '+signed(s.net.total)+' \\u00b7 1h '+signed(s.net.lastHour),cls(s.net.today))
    +tile('Sends',n(c.sends,0),n(c.wins,0)+' won \\u00b7 '+n(c.reverts,0)+' reverted \\u00b7 '+n(c.lost,0)+' lost'+(c.pending?' \\u00b7 '+c.pending+' pending':''))
    +tile('Win rate',wr,n(c.wins+c.reverts+c.lost,0)+' settled')
-   +tile('Would send',n(c.dryRunWouldSend,0),'dry-run '+c.wouldSendByReason['dry-run']+' \\u00b7 gate '+(c.wouldSendByReason.breaker+c.wouldSendByReason['gas-budget'])+' \\u00b7 in-flight '+c.wouldSendByReason['in-flight'])
+   +tile('Would send',n(c.dryRunWouldSend,0),'dry-run '+c.wouldSendByReason['dry-run']+' \\u00b7 outbid '+(c.wouldSendByReason.outbid||0)+' \\u00b7 gate '+(c.wouldSendByReason.breaker+c.wouldSendByReason['gas-budget'])+' \\u00b7 in-flight '+c.wouldSendByReason['in-flight'])
    +tile('Blocks / min',n(s.blocksPerMinute,0),n(s.blocksProcessed,0)+' processed'+(s.errors?' \\u00b7 '+s.errors+' errors':''))
    +tile('Last block',s.lastBlock==null?'-':esc(s.lastBlock),ago(s.lastBlockAt)+(head&&head.newest?' \\u00b7 head '+esc(head.newest):''))
    +tile('Opportunities',n(c.opportunities,0),n(c.candidates,0)+' cleared gas')
@@ -178,7 +178,8 @@ function render(s){
     $('gate').innerHTML='<dl class="kv"><dt>breaker</dt><dd>'+(g.breakerPaused?'<span class="tag bad">paused until block '+esc(g.pausedUntilBlock)+'</span>':'<span class="tag good">closed</span>')+' \\u00b7 '+g.consecutiveFailures+' consecutive failures</dd>'
       +'<dt>gas budget</dt><dd>'+usdc(g.budgetSpent)+' / '+usdc(g.budgetLimit)+' USDC in the last '+n(g.windowBlocks,0)+' blocks ('+n(pct,1)+'%)</dd></dl>'
       +'<div class="meter"><i class="'+mcls+'" style="width:'+Math.min(100,pct)+'%"></i></div>'
-      +(pct>=100?'<div class="tag bad">budget exhausted: dry-run only</div>':'');
+      +(pct>=100?'<div class="tag bad">budget exhausted: dry-run only</div>':'')
+      +(s.market?'<dl class="kv"><dt>market tip</dt><dd>'+(s.market.required?'a send must bid <b>'+esc(s.market.required.gwei)+' gwei</b>':'gate off')+' \\u00b7 top tips of the last '+s.market.blocks+' blocks: p50 '+esc(s.market.p50?s.market.p50.gwei:'-')+' \\u00b7 p75 '+esc(s.market.p75?s.market.p75.gwei:'-')+' \\u00b7 p90 '+esc(s.market.p90?s.market.p90.gwei:'-')+' gwei</dd></dl>':'');
   } else $('gate').innerHTML='<div class="empty">no gate status yet</div>';
   $('latency').innerHTML=s.latency.map(function(r){return '<tr><td>'+esc(r.stage)+'</td><td class="num">'+n(r.p50,1)+'</td><td class="num">'+n(r.p90,1)+'</td><td class="num">'+n(r.max,1)+'</td><td class="num">'+r.samples+'</td></tr>'}).join('');
   var opps=s.lastOpportunities;$('opps-empty').style.display=opps.length?'none':'';

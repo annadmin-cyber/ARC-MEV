@@ -515,7 +515,13 @@ PART 12  —  RUN IT FOR REAL, AND KEEP IT RUNNING
     TIP_SHARE               0.3 default; how much of expected profit to bid
                             as priority fee. Higher = more wins, lower margin.
     MIN_PRIORITY_FEE_WEI    100 gwei default floor.
-    MAX_PRIORITY_FEE_WEI    5000 gwei default cap.
+    MAX_TIP_SHARE           0.8 default; the bid is raised up to this share of the
+                            profit when the market rate demands it; above it the
+                            send is skipped as "outbid" (see the monitor's Gate panel).
+    MAX_PRIORITY_FEE_WEI    15000 gwei default cap.
+    MARKET_TIP_GATE         true: read the winning tip of every block and never bid
+                            below the going rate. A skipped send costs nothing; a
+                            send that lands behind the competition costs its tip.
     MIN_PROFIT_USDC_WEI     raise it if you see many tiny wins that barely
                             cover reverts.
     MAX_INPUT_USDC_WEI      raise once comfortable; bigger arbs make most of
@@ -602,10 +608,24 @@ Head mode stuck on "polling"
     Your read endpoint had not seen the block yet. Harmless; it uses the
     previous base fee estimate.
 
-Many reverts in a row
-    You are losing races. Lower MAX_TRACKED_POOLS (faster blocks), move the
-    server to US-East, or raise TIP_SHARE a little. The breaker already
-    protects you from bleeding.
+Many reverts in a row ("StaleState")
+    You are losing races. Each opportunity lives for exactly one block; the
+    bot that lands first in the next block takes it and everyone else
+    reverts on the price guard for a few cents. Two causes, in this order:
+    1. Speed: the transaction lands 2+ blocks after the state it saw. Check
+       the monitor's latency row (logs + probe + sim + send should be well
+       under 500 ms) and the VPS's ping to the RPC. Fix the box, not the
+       settings.
+    2. Price: it lands in the next block but behind a higher tip. On day
+       two the winners paid 3,000-13,000 gwei for 1-2 USDC arbitrages, i.e.
+       55-85% of the gross profit. The market tip gate (MARKET_TIP_GATE)
+       reads the winning tips from every block and bids up to MAX_TIP_SHARE
+       of the profit when needed, else skips ("outbid" on the monitor). A
+       skip costs nothing; a lost race costs the tip x ~36k gas. If the
+       "outbid" counter grows while wins do not, the competition is bidding
+       more than the trades are worth to a bot with this gas usage; stay
+       in DRY_RUN rather than fund their tips.
+    The breaker and the gas budget cap the bleeding either way.
 
 Bot exits with an error at start
     Read the first "error" line. Most common: malformed .env value (an address

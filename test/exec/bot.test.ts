@@ -83,7 +83,7 @@ describe('ArbBot.processBlock', () => {
 
     const header = calls.find((c) => c.method === 'eth_getBlockByNumber')
     expect(header).toBeDefined()
-    expect(header!.params).toEqual(['0x64', false])
+    expect(header!.params).toEqual(['0x64', true])
     // The header request went out before applyBlock finished (concurrent, not sequential).
     expect(header!.at).toBeLessThan(applied[0]!.at)
     expect(calls.map((c) => c.method)).toEqual(['eth_getBlockByNumber', 'eth_call', 'eth_estimateGas'])

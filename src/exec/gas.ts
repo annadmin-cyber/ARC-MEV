@@ -12,6 +12,7 @@ import type { Config } from '../config.js'
 import { log } from '../logger.js'
 import { sleep, withRetry, type RpcClients } from '../rpc/client.js'
 import { isBlockNotReady } from '../state/cache.js'
+import { topTips } from './market.js'
 
 /** The fee parameters chosen for one transaction and what they imply for its economics. */
 export interface FeeQuote {
@@ -23,6 +24,11 @@ export interface FeeQuote {
   safeGasCost: bigint
   /** `expectedProfit18 - safeGasCost`; may be negative. All in USDC wei (18 decimals). */
   net: bigint
+  /** True when the market rate (`marketTip`) exceeds what `MAX_TIP_SHARE` of the profit affords: the bid
+   *  below would land behind the competition, so the caller should skip rather than send. */
+  outbid: boolean
+  /** The market rate the bid was raised towards, when one was supplied. */
+  marketTip?: bigint
 }
 
 /** Fixed-point scale used to apply the float config ratios (`TIP_SHARE`, `GAS_SAFETY`) to bigints. */
@@ -45,7 +51,9 @@ function clamp(x: bigint, lo: bigint, hi: bigint): bigint {
  * Choose fees for a transaction expected to gain `expectedProfit18` (USDC wei, 18 decimals) with
  * gas limit `gasLimit` while the current base fee is `baseFee`:
  *
- * - tip = clamp(floor(expectedProfit18 * TIP_SHARE / gasLimit), MIN_PRIORITY_FEE_WEI, MAX_PRIORITY_FEE_WEI)
+ * - tip = clamp(floor(expectedProfit18 * TIP_SHARE / gasLimit), MIN_PRIORITY_FEE_WEI, MAX_PRIORITY_FEE_WEI);
+ *   with a `marketTip` (see `TipMarket`) above that, the tip is raised to the market rate when
+ *   `MAX_TIP_SHARE` of the profit affords it, else the quote is marked `outbid`
  * - maxFeePerGas = min(2 * baseFee + tip, MAX_FEE_PER_GAS_WEI); if even `baseFee + tip` does not
  *   fit under the cap the transaction cannot be included at the current base fee and `null` is
  *   returned ("cannot bid").
@@ -55,23 +63,43 @@ function clamp(x: bigint, lo: bigint, hi: bigint): bigint {
  * gas limit: at `TIP_SHARE = 0.5` half of the expected profit goes to the block producer.
  */
 export function feePolicy(
-  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY'>,
+  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY'> & Partial<Pick<Config, 'MAX_TIP_SHARE'>>,
   baseFee: bigint,
   expectedProfit18: bigint,
   gasLimit: bigint,
+  marketTip?: bigint,
 ): FeeQuote | null {
   if (gasLimit <= 0n) throw new RangeError(`feePolicy: gasLimit must be positive, got ${gasLimit}`)
   if (baseFee < 0n) throw new RangeError(`feePolicy: baseFee must be non-negative, got ${baseFee}`)
   const profit = expectedProfit18 > 0n ? expectedProfit18 : 0n
   const rawTip = mulRatio(profit, cfg.TIP_SHARE) / gasLimit
-  const tip = clamp(rawTip, cfg.MIN_PRIORITY_FEE_WEI, cfg.MAX_PRIORITY_FEE_WEI)
+  let tip = clamp(rawTip, cfg.MIN_PRIORITY_FEE_WEI, cfg.MAX_PRIORITY_FEE_WEI)
+  let outbid = false
+  if (marketTip !== undefined && marketTip > tip) {
+    // Raise the bid to the going rate while MAX_TIP_SHARE of the profit (and the hard cap) affords it;
+    // otherwise keep the affordable bid but flag it: sent, it would land behind the competition.
+    const affordable = clamp(mulRatio(profit, cfg.MAX_TIP_SHARE ?? 1) / gasLimit, cfg.MIN_PRIORITY_FEE_WEI, cfg.MAX_PRIORITY_FEE_WEI)
+    if (marketTip <= affordable) tip = marketTip
+    else {
+      tip = affordable > tip ? affordable : tip
+      outbid = true
+    }
+  }
   const needed = baseFee + tip
   if (needed > cfg.MAX_FEE_PER_GAS_WEI) return null
   const generous = 2n * baseFee + tip
   const maxFeePerGas = generous > cfg.MAX_FEE_PER_GAS_WEI ? cfg.MAX_FEE_PER_GAS_WEI : generous
   const gasCost = gasLimit * needed
   const safeGasCost = mulRatio(gasCost, cfg.GAS_SAFETY)
-  return { maxFeePerGas, maxPriorityFeePerGas: tip, gasCost, safeGasCost, net: expectedProfit18 - safeGasCost }
+  return {
+    maxFeePerGas,
+    maxPriorityFeePerGas: tip,
+    gasCost,
+    safeGasCost,
+    net: expectedProfit18 - safeGasCost,
+    outbid,
+    ...(marketTip === undefined ? {} : { marketTip }),
+  }
 }
 
 /** Current base fee plus, when available, the recent median priority fee (an information metric only). */
@@ -108,6 +136,8 @@ export interface NextBaseFee {
   block: bigint
   /** `extraData` when the header carried the 8-byte announcement, `fallback` for the +12.5% estimate. */
   source: 'extraData' | 'fallback'
+  /** The block's largest effective priority fees, descending (empty when the header came without transactions). */
+  topTips: bigint[]
 }
 
 /** Attempts made when the node has not served `block` yet (-32001 / -32014). */
@@ -120,27 +150,39 @@ const HEADER_NOT_READY_WAIT_MS = 50
  * `extraData` length means the announcement is absent and the EIP-1559 worst case
  * `baseFeePerGas * 1125 / 1000` is used instead.
  */
-export function parseNextBaseFee(header: { number: bigint; baseFeePerGas: bigint | null | undefined; extraData: Hex | undefined }): NextBaseFee {
+export function parseNextBaseFee(header: {
+  number: bigint
+  baseFeePerGas: bigint | null | undefined
+  extraData: Hex | undefined
+  transactions?: readonly (Hex | { maxPriorityFeePerGas?: bigint | null | undefined; maxFeePerGas?: bigint | null | undefined; gasPrice?: bigint | null | undefined })[]
+}): NextBaseFee {
   const baseFee = header.baseFeePerGas
   if (baseFee === null || baseFee === undefined) throw new Error(`parseNextBaseFee: block ${header.number} has no baseFeePerGas`)
+  const txs = (header.transactions ?? []).filter((t): t is Exclude<typeof t, Hex> => typeof t !== 'string')
+  const tips = topTips(txs, baseFee)
   const extra = header.extraData
   if (extra !== undefined && isHex(extra) && extra.length === 2 + 16) {
-    return { nextBaseFee: hexToBigInt(extra), baseFee, block: header.number, source: 'extraData' }
+    return { nextBaseFee: hexToBigInt(extra), baseFee, block: header.number, source: 'extraData', topTips: tips }
   }
-  return { nextBaseFee: (baseFee * 1125n) / 1000n, baseFee, block: header.number, source: 'fallback' }
+  return { nextBaseFee: (baseFee * 1125n) / 1000n, baseFee, block: header.number, source: 'fallback', topTips: tips }
 }
 
 /**
  * Read the header of `block` (or the latest when omitted) and derive the next block's base fee
- * with {@link parseNextBaseFee}. Retries briefly while the node answers "block not found" for a
- * block it will serve within milliseconds (heads arrive before every node has indexed them).
+ * with {@link parseNextBaseFee}. With `withTransactions` (the default) the block's transactions
+ * come along in the same request, so their tips feed the `TipMarket` at no extra round trip.
+ * Retries briefly while the node answers "block not found" for a block it will serve within
+ * milliseconds (heads arrive before every node has indexed them).
  */
-export async function readNextBaseFee(clients: Pick<RpcClients, 'http'>, block?: bigint): Promise<NextBaseFee> {
+export async function readNextBaseFee(clients: Pick<RpcClients, 'http'>, block?: bigint, withTransactions = true): Promise<NextBaseFee> {
   const label = block === undefined ? 'eth_getBlockByNumber(latest)' : `eth_getBlockByNumber(${block})`
   for (let attempt = 1; ; attempt++) {
     try {
       const header = await withRetry(
-        () => (block === undefined ? clients.http.getBlock({ blockTag: 'latest', includeTransactions: false }) : clients.http.getBlock({ blockNumber: block, includeTransactions: false })),
+        () =>
+          block === undefined
+            ? clients.http.getBlock({ blockTag: 'latest', includeTransactions: withTransactions })
+            : clients.http.getBlock({ blockNumber: block, includeTransactions: withTransactions }),
         // Per-block path: a short policy, the slow default would hold the block loop for 9+ s.
         { label, tries: 3, baseMs: 120 },
       )

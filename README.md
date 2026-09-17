@@ -123,7 +123,8 @@ Everything is in `.env` (see `.env.example` for defaults and comments). The knob
 |---|---|
 | `MIN_PROFIT_USDC_WEI` | Minimum net profit after gas, in 18-decimal USDC wei. |
 | `MAX_INPUT_USDC_WEI` | Largest trade size the optimiser may pick. |
-| `TIP_SHARE`, `MAX_PRIORITY_FEE_WEI`, `MIN_PRIORITY_FEE_WEI` | How aggressively to bid in the priority-fee auction. Arc sorts blocks by tip; top-of-block tips are hundreds of gwei. |
+| `TIP_SHARE`, `MAX_TIP_SHARE`, `MAX_PRIORITY_FEE_WEI`, `MIN_PRIORITY_FEE_WEI` | How aggressively to bid in the priority-fee auction. Arc sorts blocks by tip. The base bid is `TIP_SHARE` of the expected profit; when the market rate is higher the bid is raised up to `MAX_TIP_SHARE` of the profit, beyond that the send is skipped as "outbid". |
+| `MARKET_TIP_GATE`, `MARKET_TIP_BLOCKS`, `MARKET_TIP_QUANTILE`, `MARKET_TIP_MARGIN` | The market rate: the top tip of each recent block (read from the header the bot already fetches), summarised as a quantile over the window times a margin. Day-two winners paid 3,000-13,000 gwei for 1-2 USDC arbitrages. |
 | `GAS_SAFETY` | Multiplier on estimated gas cost before it is subtracted from expected profit. A losing race still pays gas. |
 | `GUARD_TOLERANCE_BPS` | Price tolerance for the on-chain guards. Smaller = cheaper failures, more false aborts. |
 | `MAX_TRACKED_POOLS`, `MIN_POOL_LIQUIDITY`, `ALLOWED_HOOKS` | Which pools to watch (every venue). Liquidity `L` scales with `sqrt(units0 * units1)`, so the default minimum is 1e8: the deepest pool on Arc (cirBTC/USDC 0.01% v3, 8 x 6 decimals, ~$10M) has `L` ≈ 4e11 while an 18-decimal pair with $130k has ≈ 1.6e18; v2 pairs count `isqrt(reserve0 * reserve1)`. Hooked pools are never simulated locally unless allow-listed; they go through the probe instead. |
@@ -168,7 +169,9 @@ in the busiest hour and ~2,800 USDC/h since launch, but the median winning trans
 the top 10% of transactions make 87% of the profit, the top five operators take 62%, and 16% of "wins"
 lost money to their own gas. The steadiest bot never bids for the top of the block. Expect tens of USDC
 per hour at best from a fresh bot unless it wins a tail event. The defaults (0.15 USDC minimum profit,
-30% of profit as tip, 100–5,000 gwei tips, 5 USDC/h gas budget) are set from those numbers.
+30% of profit as the base tip, up to 80% when the market rate demands it, 100–15,000 gwei tips,
+5 USDC/h gas budget) are set from those numbers and from the day-two auction, where the bots taking
+1-2 USDC arbitrages paid 3,000-13,000 gwei in the block right after the opportunity appeared.
 
 ## Risks you should understand
 

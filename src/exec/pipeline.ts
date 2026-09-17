@@ -119,18 +119,27 @@ export interface Candidate {
  * `MIN_PROFIT_USDC_WEI`, in ranking order, at most `max` of them.
  */
 export function quoteCandidates(
-  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY' | 'QUOTE_GAS' | 'MIN_PROFIT_USDC_WEI'>,
+  cfg: Pick<Config, 'TIP_SHARE' | 'MIN_PRIORITY_FEE_WEI' | 'MAX_PRIORITY_FEE_WEI' | 'MAX_FEE_PER_GAS_WEI' | 'GAS_SAFETY' | 'QUOTE_GAS' | 'MIN_PROFIT_USDC_WEI'> &
+    Partial<Pick<Config, 'MAX_TIP_SHARE'>>,
   opps: readonly EvaluatedOpportunity[],
   baseFee: bigint,
   max = 3,
+  marketTip?: bigint,
+  outbid?: Candidate[],
 ): Candidate[] {
   const out: Candidate[] = []
   for (const opp of opps) {
     if (out.length >= max) break
     const expected18 = opp.grossProfitUsdc
     if (expected18 === undefined) continue
-    const quote = feePolicy(cfg, baseFee, expected18, BigInt(cfg.QUOTE_GAS))
+    const quote = feePolicy(cfg, baseFee, expected18, BigInt(cfg.QUOTE_GAS), marketTip)
     if (!quote || quote.net <= cfg.MIN_PROFIT_USDC_WEI) continue
+    // Priced below the going rate: simulating it would only confirm a transaction that lands behind
+    // the competition, so keep it out of the candidates (reported separately).
+    if (quote.outbid) {
+      outbid?.push({ opp, expected18, quote })
+      continue
+    }
     out.push({ opp, expected18, quote })
   }
   return out
@@ -205,13 +214,15 @@ export function pickBest(
     | 'MIN_PROFIT_USDC_WEI'
     | 'startCurrencies'
     | 'EXECUTOR_ADDRESS'
-  >,
+  > &
+    Partial<Pick<Config, 'MAX_TIP_SHARE'>>,
   simulated: readonly SimulatedCandidate[],
   baseFee: bigint,
+  marketTip?: bigint,
 ): ExecutionPlan | undefined {
   let best: ExecutionPlan | undefined
   for (const sim of simulated) {
-    const plan = planFor(cfg, sim, baseFee)
+    const plan = planFor(cfg, sim, baseFee, marketTip)
     if (plan && (!best || plan.quote.net > best.quote.net)) best = plan
   }
   return best
@@ -222,13 +233,14 @@ export function planFor(
   cfg: Parameters<typeof pickBest>[0],
   sim: SimulatedCandidate,
   baseFee: bigint,
+  marketTip?: bigint,
 ): ExecutionPlan | undefined {
   if (!sim.result.ok || !cfg.EXECUTOR_ADDRESS) return undefined
   const decimals = cfg.startCurrencies.get(sim.candidate.opp.cycle.start.toLowerCase() as Address)
   if (decimals === undefined) return undefined
   const gas = sim.result.gasSource === 'estimate' ? withHeadroom(sim.result.gas) : capGas(BigInt(cfg.GAS_LIMIT))
   const simulatedProfit18 = to18(sim.result.profit, decimals)
-  const quote = feePolicy(cfg, baseFee, simulatedProfit18, gas)
+  const quote = feePolicy(cfg, baseFee, simulatedProfit18, gas, marketTip)
   if (!quote || quote.net <= cfg.MIN_PROFIT_USDC_WEI) return undefined
   const minProfit = from18(cfg.MIN_PROFIT_USDC_WEI + quote.safeGasCost, decimals)
   const data = encodeExecute(sim.steps, sim.candidate.opp.amountIn, minProfit, sim.guards)

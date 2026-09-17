@@ -59,7 +59,7 @@ describe('BotStats counters', () => {
       opportunities: 5,
       candidates: 2,
       dryRunWouldSend: 2,
-      wouldSendByReason: { 'dry-run': 1, 'no-executor': 0, breaker: 1, 'gas-budget': 0, 'in-flight': 0 },
+      wouldSendByReason: { 'dry-run': 1, 'no-executor': 0, breaker: 1, 'gas-budget': 0, 'in-flight': 0, outbid: 0 },
       sends: 3,
       wins: 1,
       reverts: 1,
