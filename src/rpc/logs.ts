@@ -33,7 +33,15 @@ export interface GetLogsChunkedParams {
   concurrency?: number
   /** Called after every chunk with the range it covered and the logs it returned. */
   onChunk?: (fromBlock: bigint, toBlock: bigint, logs: Log[]) => void
+  /** Retry policy per chunk (default: the general `withRetry` defaults). */
+  retry?: RetryOptions
 }
+
+/**
+ * Patient retry policy for backfills on the public gateway, whose eth_getLogs bucket is tiny
+ * (about 2 requests/s clean): 12 tries, 0.5 s doubling to 20 s, roughly 2.5 minutes in total.
+ */
+export const BACKFILL_RETRY: RetryOptions = { tries: 12, baseMs: 500, maxMs: 20_000 }
 
 /** A raw log with the fields the bot needs, block number and log index guaranteed present. */
 export type RawLog = Log<bigint, number, false>
@@ -58,7 +66,7 @@ export async function getLogsChunked(client: PublicClient, params: GetLogsChunke
     ranges.push([start, end])
   }
   const perChunk = await Promise.all(
-    ranges.map(([start, end]) => fetchRangeBisecting(client, address, topics, start, end, limit, params.onChunk)),
+    ranges.map(([start, end]) => fetchRangeBisecting(client, address, topics, start, end, limit, params.onChunk, params.retry ?? {})),
   )
   return perChunk.flat()
 }
@@ -75,17 +83,18 @@ async function fetchRangeBisecting(
   to: bigint,
   limit: Limiter,
   onChunk: GetLogsChunkedParams['onChunk'],
+  retry: RetryOptions,
 ): Promise<RawLog[]> {
   try {
-    const logs = await limit(() => fetchLogsOnce(client, address, topics, from, to))
+    const logs = await limit(() => fetchLogsOnce(client, address, topics, from, to, retry))
     onChunk?.(from, to, logs)
     return logs
   } catch (error) {
     if (from >= to || !isLogRangeTooLarge(error)) throw error
     const mid = from + (to - from) / 2n
     const [head, tail] = await Promise.all([
-      fetchRangeBisecting(client, address, topics, from, mid, limit, onChunk),
-      fetchRangeBisecting(client, address, topics, mid + 1n, to, limit, onChunk),
+      fetchRangeBisecting(client, address, topics, from, mid, limit, onChunk, retry),
+      fetchRangeBisecting(client, address, topics, mid + 1n, to, limit, onChunk, retry),
     ])
     return head.concat(tail)
   }

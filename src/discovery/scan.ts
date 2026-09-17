@@ -5,7 +5,7 @@ import type { Config } from '../config.js'
 import { log } from '../logger.js'
 import { isqrt } from '../math/v2.js'
 import { extsload, limiter, type RpcClients } from '../rpc/client.js'
-import { getLogsChunked, MAX_LOG_RANGE, safeHead, type RawLog } from '../rpc/logs.js'
+import { BACKFILL_RETRY, getLogsChunked, MAX_LOG_RANGE, safeHead, type RawLog } from '../rpc/logs.js'
 import { aggregate3, type Call3 } from '../rpc/multicall.js'
 import { decodeUint128, liquiditySlot } from '../state/slots.js'
 import { decodeV2Reserves } from '../state/v2.js'
@@ -73,7 +73,8 @@ export async function scanPools(
         events: INITIALIZE,
         fromBlock: start,
         toBlock: end,
-        concurrency: opts.concurrency ?? 3,
+        concurrency: opts.concurrency ?? 2,
+      retry: BACKFILL_RETRY,
       })
       let added = 0
       for (const raw of logs) {
@@ -191,7 +192,8 @@ export async function scanVenues(
       events: [POOL_CREATED, PAIR_CREATED],
       fromBlock: start,
       toBlock: end,
-      concurrency: opts.concurrency ?? 3,
+      concurrency: opts.concurrency ?? 2,
+      retry: BACKFILL_RETRY,
     })
     let added = 0
     let skipped = 0
