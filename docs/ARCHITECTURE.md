@@ -55,6 +55,10 @@ src/                       TypeScript bot (viem)
   exec/                    executor calldata by kind, next-block base fee from the header's extraData,
                            on-chain simulation, priority-fee policy, WebSocket head source with stall
                            watchdog, circuit breaker + rolling gas budget, nonce management, sending
+  monitor/                 live monitor: stats.ts collects per-block timings, opportunities, sends and
+                           receipts in memory (bounded ring buffers, no I/O); server.ts serves them over
+                           node:http as a status page (/), JSON (/api/status) and Prometheus text (/metrics),
+                           on MONITOR_PORT, bound to localhost
   main.ts                  wiring + block loop
   cli/                     one-shot tools (discover, scan)
 ```
@@ -99,7 +103,9 @@ src/                       TypeScript bot (viem)
    (`GAS_BUDGET_USDC_WEI` per `GAS_BUDGET_WINDOW_BLOCKS`) can turn sending off.
    In `DRY_RUN` the plan is logged instead.
 7. Receipts are logged with realised profit and gas paid, and fed to the breaker
-   and the budget.
+   and the budget. Every stage above also reports to the in-memory monitor stats
+   (timings, opportunities, sends, receipts, gate state), which the optional
+   `MONITOR_PORT` server exposes as a page, JSON and Prometheus text.
 
 ## Executor contract
 

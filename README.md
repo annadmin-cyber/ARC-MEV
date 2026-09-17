@@ -74,6 +74,34 @@ npm run bot
    `cast send $EXECUTOR "sweep(address,address)" 0x3600000000000000000000000000000000000000 $OWNER`
    (use `0x0000000000000000000000000000000000000000` for native USDC).
 
+## Live monitor
+
+The bot has a built-in status page. Set `MONITOR_PORT` (for example `MONITOR_PORT=3000`) and
+`npm run bot` logs `live monitor listening` with the URL. The page (plain HTML, no external
+assets, works on a phone) refreshes every 2 s and shows:
+
+- the chain, dry-run / live mode, head-source mode (`ws`, `ws-stalled`, `polling`) and executor;
+- KPI tiles: realised profit, gas paid and net (today / last hour / total), sends with wins,
+  reverts and lost, win rate, "would send" counts (dry run, gate, in-flight), blocks per
+  minute, last block, uptime;
+- the circuit breaker and the rolling gas budget with a progress bar;
+- per-stage latency (logs, eval, probe, sim, send) p50 / p90 / max over the last 600 blocks;
+- the last 30 opportunities (block, cycle, input, expected and net profit, probed, on-chain
+  simulation result) and the last 20 sends (block, hash linked to the explorer, tip, outcome,
+  realised profit, fee paid).
+
+Endpoints: `GET /` is the page, `GET /api/status` the same data as JSON (bigints as decimal
+strings plus 6-decimal USDC strings), `GET /metrics` a Prometheus exposition
+(`arcmev_blocks_processed_total`, `arcmev_sends_total`, `arcmev_wins_total`,
+`arcmev_reverts_total`, `arcmev_lost_total`, `arcmev_profit_usdc`, `arcmev_gas_paid_usdc`,
+`arcmev_last_block`, `arcmev_block_latency_ms{stage,quantile}`, `arcmev_breaker_paused`,
+`arcmev_budget_spent_usdc`, `arcmev_head_mode{mode}`, ...) that Prometheus or a Grafana agent can
+scrape directly.
+
+There is no authentication and the server binds to `127.0.0.1` (`MONITOR_HOST`), so view it
+remotely through an SSH tunnel: `ssh -L 3000:127.0.0.1:3000 user@bot-host`, then open
+`http://localhost:3000`. Everything is in memory and resets when the bot restarts.
+
 ## Which endpoints to use
 
 Measured on launch day (details in `docs/ARC_RESEARCH.md`):
@@ -105,6 +133,7 @@ Everything is in `.env` (see `.env.example` for defaults and comments). The knob
 | `WS_URL`, `WS_URLS`, `WS_STALL_MS`, `POLL_INTERVAL_MS` | Head source: every WebSocket endpoint's `newHeads` race (de-duplicated by block number); no head for `WS_STALL_MS` switches to `eth_blockNumber` polling until heads resume. Without any WebSocket the bot polls. |
 | `MAX_CONSECUTIVE_REVERTS`, `BREAKER_PAUSE_BLOCKS` | Circuit breaker: after that many reverted or lost transactions in a row, sending pauses for that many blocks (a run of failures usually means the model is off). |
 | `GAS_BUDGET_USDC_WEI`, `GAS_BUDGET_WINDOW_BLOCKS` | Rolling gas budget: once that much gas (18-decimal USDC wei) was paid within the window, the bot only dry-runs until enough spending rolls out of it. |
+| `MONITOR_PORT`, `MONITOR_HOST` | Live monitor (see above): the status page, `/api/status` and `/metrics` on that port; 0 (default) disables it. Binds to localhost. |
 
 ## What has been verified (and what has not)
 

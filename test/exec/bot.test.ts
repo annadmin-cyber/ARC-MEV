@@ -7,6 +7,7 @@ import { Sender, type SendTransport } from '../../src/exec/sender.js'
 import { clearOperatorCache } from '../../src/exec/simulate.js'
 import { groupCycles } from '../../src/exec/pipeline.js'
 import { log } from '../../src/logger.js'
+import { BotStats } from '../../src/monitor/stats.js'
 import type { RpcClients } from '../../src/rpc/client.js'
 import type { RawLog } from '../../src/rpc/logs.js'
 import type { StateCache } from '../../src/state/cache.js'
@@ -96,6 +97,36 @@ describe('ArbBot.processBlock', () => {
     const tipWei = Number(details['tipGwei']) * 1e9
     const maxFeeWei = Number(details['maxFeeGwei']) * 1e9
     expect(maxFeeWei - tipWei).toBeCloseTo(Number(2n * NEXT_BASE_FEE), -8)
+  })
+
+  it('reports every block, the candidates and the dry-run would-send to the stats', async () => {
+    const { client } = fakeHttp(defaultHandler())
+    const { cache } = fakeCache(STATES, [P2.poolId], 5)
+    const stats = new BotStats()
+    const onBlock = vi.spyOn(stats, 'onBlock')
+    const onDryRun = vi.spyOn(stats, 'onDryRun')
+    const onOpportunity = vi.spyOn(stats, 'onOpportunity')
+    const bot = new ArbBot({ clients: { http: client } as RpcClients, cfg, cache, infos: INFOS, groups, stats })
+    expect(bot.stats).toBe(stats)
+    await bot.processBlock(100n, 0n)
+    await bot.processBlock(101n, 0n)
+
+    expect(onBlock).toHaveBeenCalledTimes(2)
+    const first = onBlock.mock.calls[0]![0]
+    expect(first).toMatchObject({ block: 100n, touched: 1, opportunities: 1, candidates: 1 })
+    expect(first.timings.logs).toBeGreaterThan(0)
+    expect(first.timings.sim).toBeGreaterThanOrEqual(0)
+    expect(onOpportunity).toHaveBeenCalledTimes(2)
+    expect(onOpportunity.mock.calls[0]![0]).toMatchObject({ block: 100n, probed: false, simulated: { ok: true, profit18: SIM_PROFIT } })
+    expect(onDryRun).toHaveBeenCalledTimes(2)
+    expect(onDryRun.mock.calls[0]![0]).toMatchObject({ block: 100n, reason: 'dry-run' })
+
+    const snap = stats.snapshot()
+    expect(snap.blocksProcessed).toBe(2)
+    expect(snap.lastBlock).toBe('101')
+    expect(snap.counts.dryRunWouldSend).toBe(2)
+    expect(snap.gate).toMatchObject({ breakerPaused: false, consecutiveFailures: 0, budgetSpent: { wei: '0' } })
+    expect(() => JSON.stringify(snap)).not.toThrow()
   })
 
   it('does nothing when nothing was touched and no full evaluation is due', async () => {

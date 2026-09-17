@@ -10,12 +10,13 @@
 import type { Address, Hex } from 'viem'
 import type { Config } from '../config.js'
 import { log } from '../logger.js'
+import { BotStats, type GateStatus, type WouldSendReason } from '../monitor/stats.js'
 import type { RpcClients } from '../rpc/client.js'
 import type { StateCache } from '../state/cache.js'
-import { rankOpportunities, type EvaluatedOpportunity, type HookedProbe, type InputBounds } from '../strategy/index.js'
+import { rankOpportunities, to18, type EvaluatedOpportunity, type HookedProbe, type InputBounds } from '../strategy/index.js'
 import { poolKind, type PoolInfo, type PoolState } from '../types.js'
 import { SendGate } from './breaker.js'
-import { readBaseFee, readNextBaseFee, type NextBaseFee } from './gas.js'
+import { feePolicy, readBaseFee, readNextBaseFee, type NextBaseFee } from './gas.js'
 import {
   boundsByStart,
   describeCycle,
@@ -25,6 +26,7 @@ import {
   pickBest,
   quoteCandidates,
   simulateCandidates,
+  type Candidate,
   type CycleGroup,
   type ExecutionPlan,
   type SimulatedCandidate,
@@ -79,6 +81,8 @@ export interface ArbBotDeps {
   probe?: HookedProbe
   /** Circuit breaker + gas budget; a default one from `cfg` is built when absent. */
   gate?: SendGate
+  /** Run statistics for the live monitor; a fresh (unexposed) one is built when absent. */
+  stats?: BotStats
 }
 
 export class ArbBot {
@@ -88,12 +92,48 @@ export class ArbBot {
   private readonly allInfos: Map<Hex, PoolInfo>
   private readonly bounds: Map<Address, InputBounds>
   readonly gate: SendGate
+  readonly stats: BotStats
 
   constructor(private readonly deps: ArbBotDeps) {
     this.cycleCount = deps.groups.reduce((n, g) => n + g.cycles.length, 0)
     this.allInfos = new Map([...deps.infos, ...(deps.probe ? deps.probe.infos() : [])])
     this.bounds = boundsByStart(deps.cfg)
     this.gate = deps.gate ?? new SendGate(deps.cfg)
+    this.stats = deps.stats ?? new BotStats()
+  }
+
+  /** The gate's state as of `block`, for the monitor. */
+  gateStatus(block: bigint): GateStatus {
+    const pausedUntil = this.gate.breaker.pausedUntilBlock()
+    const paused = pausedUntil !== undefined && block < pausedUntil
+    return {
+      breakerPaused: paused,
+      ...(paused ? { pausedUntilBlock: pausedUntil } : {}),
+      consecutiveFailures: this.gate.breaker.consecutiveFailures,
+      budgetSpent18: this.gate.budget.spent(block),
+      budgetLimit18: this.gate.budget.budget,
+      windowBlocks: this.gate.budget.windowBlocks,
+    }
+  }
+
+  /**
+   * {@link processBlock}'s body, wrapped so every block (including one that threw) is counted
+   * once with its timings, opportunity / candidate counts and the gate state after it.
+   */
+  async processBlock(block: bigint, skipped: bigint): Promise<void> {
+    const timing: BlockTiming = { logs: 0, eval: 0, probe: 0, sim: 0, send: 0 }
+    const counts = { touched: 0, opportunities: 0, candidates: 0 }
+    try {
+      await this.run(block, skipped, timing, counts)
+    } catch (error) {
+      this.stats.onError({ block, message: errorMessage(error) })
+      throw error
+    } finally {
+      // Without a probe the stage never runs: leave it out so its latency row stays empty.
+      const { probe: probeMs, ...rest } = timing
+      this.stats.onBlock({ block, timings: this.deps.probe ? { ...rest, probe: probeMs } : rest, ...counts })
+      this.stats.setGate(this.gateStatus(block))
+    }
   }
 
   /**
@@ -103,9 +143,8 @@ export class ArbBot {
    * blocks), probe hooked pools, and act on the best opportunity if any clears the profit bar
    * after gas and on-chain simulation.
    */
-  async processBlock(block: bigint, skipped: bigint): Promise<void> {
+  private async run(block: bigint, skipped: bigint, timing: BlockTiming, counts: { touched: number; opportunities: number; candidates: number }): Promise<void> {
     const { cfg, cache, clients, groups, probe } = this.deps
-    const timing: BlockTiming = { logs: 0, eval: 0, probe: 0, sim: 0, send: 0 }
     const started = performance.now()
 
     const [{ touched, replayed }, header] = await Promise.all([
@@ -124,6 +163,7 @@ export class ArbBot {
       }
     }
     timing.logs = elapsed(started)
+    counts.touched = touched.size
     const kinds = touchedKinds(touched, this.allInfos)
 
     const full = this.blocksSinceFullEval >= FULL_EVAL_EVERY
@@ -137,6 +177,15 @@ export class ArbBot {
       const tProbe = performance.now()
       const result = await probe.probe(block, states, this.bounds, touchedHooked, touched)
       timing.probe = elapsed(tProbe)
+      this.stats.onProbe({
+        block,
+        touchedHooked: result.touchedHooked,
+        candidates: result.candidates,
+        probes: result.probes,
+        calls: result.calls,
+        latencyMs: result.latencyMs,
+        found: result.opportunities.length,
+      })
       log.debug(
         { block, touchedHooked: result.touchedHooked, candidates: result.candidates, probes: result.probes, calls: result.calls, latencyMs: result.latencyMs, found: result.opportunities.length },
         'probe: done',
@@ -155,10 +204,16 @@ export class ArbBot {
       return
     }
 
+    counts.opportunities = opps.length
     const baseFee = await this.baseFeeFor(header)
     const candidates = quoteCandidates(cfg, opps, baseFee, MAX_SIMULATIONS)
+    counts.candidates = candidates.length
     const best = opps[0]
     if (candidates.length === 0 || !best) {
+      // Nothing cleared gas: record the best one so the monitor shows what was close.
+      const expected18 = best?.grossProfitUsdc ?? 0n
+      const net18 = feePolicy(cfg, baseFee, expected18, BigInt(cfg.QUOTE_GAS))?.net ?? 0n
+      if (best) this.stats.onOpportunity({ block, cycle: describeCycle(best.cycle, this.allInfos), amountIn: best.amountIn.toString(), expected18, net18, probed: best.probed ?? false })
       log.info(
         {
           block,
@@ -175,8 +230,10 @@ export class ArbBot {
     }
 
     if (!cfg.EXECUTOR_ADDRESS) {
+      for (const c of candidates) this.stats.onOpportunity(this.opportunityEvent(block, c))
       const top = candidates[0]
       if (top) {
+        this.stats.onDryRun({ block, cycle: describeCycle(top.opp.cycle, this.allInfos), expected18: top.expected18, net18: top.quote.net, reason: 'no-executor' })
         log.info(
           {
             block,
@@ -197,6 +254,7 @@ export class ArbBot {
     const tSim = performance.now()
     const simulated = await simulateCandidates(clients, cfg, candidates, states as Map<Hex, PoolState>, this.allInfos, block)
     timing.sim = elapsed(tSim)
+    for (const sim of simulated) this.stats.onOpportunity(this.opportunityEvent(block, sim.candidate, sim))
     const plan = pickBest(cfg, simulated, baseFee)
     if (!plan) {
       log.info({ block, candidates: simulated.map((s) => this.summariseSim(s)), timing }, 'candidates rejected by on-chain simulation')
@@ -237,21 +295,27 @@ export class ArbBot {
       guards: plan.guards.length,
       truncated: opp.truncated,
     }
+    const wouldSend = (reason: WouldSendReason): void =>
+      this.stats.onDryRun({ block, cycle: details.cycle, expected18: plan.candidate.expected18, net18: plan.quote.net, reason })
     if (cfg.DRY_RUN || !sender) {
+      wouldSend('dry-run')
       log.info(details, 'would send (DRY_RUN)')
       return
     }
     const blocked = this.gate.check(block)
     if (blocked) {
+      wouldSend(blocked.kind === 'breaker' ? 'breaker' : 'gas-budget')
       if (blocked.kind === 'breaker') log.warn({ ...details, pausedUntil: blocked.until }, 'would send (circuit breaker paused sending)')
       else log.warn({ ...details, spentUsdc: formatUsdc(blocked.spent), budgetUsdc: formatUsdc(blocked.budget), freesAt: blocked.freesAt }, 'would send (gas budget exhausted)')
       return
     }
     if (!sender.canSend(block)) {
+      wouldSend('in-flight')
       log.warn({ ...details, inFlight: sender.inFlight }, 'skipping: a transaction is still in flight')
       return
     }
     const sent = await sender.send(plan.tx, block)
+    this.stats.onSend({ block, hash: sent.hash, expected18: plan.simulatedProfit18, tip: plan.tx.maxPriorityFeePerGas, maxFee: plan.tx.maxFeePerGas, gas: plan.gas })
     log.info({ ...details, hash: sent.hash, nonce: sent.nonce, sentTo: sent.sentTo }, 'sent')
     // Do not hold up the block loop for the receipt; the in-flight guard prevents double sends.
     void this.trackOutcome(sender, sent, block)
@@ -266,27 +330,51 @@ export class ArbBot {
     try {
       const summary = await sender.waitForReceipt(sent.hash)
       if (summary) {
-        this.settle(sentAtBlock, summary)
+        this.settle(sent.hash, sentAtBlock, summary)
         return
       }
       log.info({ hash: sent.hash, nonce: sent.nonce, sentAtBlock }, 'receipt outcome unknown, tracking in the background')
       const outcome = await sender.trackReceipt(sent)
-      this.settle(sentAtBlock, outcome.kind === 'mined' ? outcome.summary : undefined)
+      if (outcome.kind === 'mined') this.settle(sent.hash, sentAtBlock, outcome.summary)
+      else this.settle(sent.hash, sentAtBlock, undefined, outcome.reason)
     } catch (error) {
       log.warn({ err: error, hash: sent.hash }, 'receipt wait failed')
-      this.settle(sentAtBlock, undefined)
+      this.settle(sent.hash, sentAtBlock, undefined, 'receipt-error')
     }
   }
 
-  /** Feed a receipt (or its absence) to the breaker and the gas budget. */
-  private settle(sentAtBlock: bigint, summary: Awaited<ReturnType<Sender['waitForReceipt']>>): void {
+  /** Feed a receipt (or its absence) to the breaker, the gas budget and the monitor. */
+  private settle(hash: Hex, sentAtBlock: bigint, summary: Awaited<ReturnType<Sender['waitForReceipt']>>, lostReason = 'unknown'): void {
+    if (summary) {
+      const executed = summary.executed
+      const decimals = executed ? this.deps.cfg.startCurrencies.get(executed.currency) : undefined
+      this.stats.onReceipt({
+        hash: summary.hash,
+        status: summary.status,
+        ...(executed && decimals !== undefined ? { profit18: to18(executed.profit, decimals) } : {}),
+        feePaid18: summary.feePaid,
+        block: summary.blockNumber,
+      })
+    } else {
+      this.stats.onLost({ hash, reason: lostReason })
+    }
     const tripped = summary ? this.gate.onReceipt(summary.blockNumber, summary.status, summary.feePaid) : this.gate.onLost(sentAtBlock)
+    this.stats.setGate(this.gateStatus(summary ? summary.blockNumber : sentAtBlock))
     if (tripped) {
       log.warn(
         { pausedUntil: this.gate.breaker.pausedUntilBlock(), trips: this.gate.breaker.tripCount, maxConsecutive: this.gate.breaker.maxConsecutive },
         'circuit breaker tripped: sending paused',
       )
     }
+  }
+
+  /** A candidate (with its simulation, when it ran) as the monitor records it. */
+  private opportunityEvent(block: bigint, c: Candidate, sim?: SimulatedCandidate): Parameters<BotStats['onOpportunity']>[0] {
+    const base = { block, cycle: describeCycle(c.opp.cycle, this.allInfos), amountIn: c.opp.amountIn.toString(), expected18: c.expected18, net18: c.quote.net, probed: c.opp.probed ?? false }
+    if (!sim) return base
+    if (!sim.result.ok) return { ...base, simulated: { ok: false, reason: sim.result.reason } }
+    const decimals = this.deps.cfg.startCurrencies.get(c.opp.cycle.start.toLowerCase() as Address)
+    return { ...base, simulated: { ok: true, ...(decimals === undefined ? {} : { profit18: to18(sim.result.profit, decimals) }) } }
   }
 
   private summariseSim(sim: SimulatedCandidate): Record<string, unknown> {

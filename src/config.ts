@@ -103,6 +103,10 @@ const schema = z.object({
   GAS_BUDGET_USDC_WEI: bigintStr('5000000000000000000'),
   /** Rolling window (blocks, ~1 h at 500 ms) over which GAS_BUDGET_USDC_WEI applies. */
   GAS_BUDGET_WINDOW_BLOCKS: z.coerce.number().int().min(1).default(7200),
+  /** Live monitor (HTML page, `/api/status` JSON, `/metrics` Prometheus text) on this port; 0 disables it. */
+  MONITOR_PORT: z.coerce.number().int().min(0).max(65535).default(0),
+  /** Address the monitor binds to. Keep it on localhost and use an SSH tunnel: there is no authentication. */
+  MONITOR_HOST: z.string().min(1).default('127.0.0.1'),
   /** Directory for persisted pool data. */
   DATA_DIR: z.string().default('data'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),

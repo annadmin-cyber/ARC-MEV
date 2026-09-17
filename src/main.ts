@@ -19,6 +19,8 @@ import { groupCycles } from './exec/pipeline.js'
 import { probeIoFor, probeSettingsFor } from './exec/probeIo.js'
 import { Sender } from './exec/sender.js'
 import { log } from './logger.js'
+import { startMonitorServer, type MonitorServer } from './monitor/server.js'
+import { BotStats } from './monitor/stats.js'
 import { makeClients, withRetry, type RpcClients } from './rpc/client.js'
 import { isBlockNotReady, StateCache } from './state/cache.js'
 import { buildCycles, HookedProbe, selectProbePools } from './strategy/index.js'
@@ -57,8 +59,22 @@ async function main(): Promise<void> {
 
   const probe = cfg.PROBE_HOOKED_POOLS ? await makeProbe(clients, cfg, store, tracked, infos, initBlock) : undefined
   const sender = cfg.DRY_RUN ? undefined : makeSender(clients, cfg)
-  const bot = new ArbBot({ clients, cfg, cache, infos, groups, ...(sender ? { sender } : {}), ...(probe ? { probe } : {}) })
-  const loop = new BlockLoop((block, skipped) => bot.processBlock(block, skipped))
+  const stats = new BotStats()
+  stats.setStatic({
+    chainId: cfg.CHAIN_ID,
+    dryRun: cfg.DRY_RUN,
+    executor: cfg.EXECUTOR_ADDRESS ?? null,
+    trackedPools: tracked.length,
+    cycles: cycles.length,
+    probePools: probe?.pools.length ?? 0,
+  })
+  const monitor = await startMonitor(cfg, stats)
+  const bot = new ArbBot({ clients, cfg, cache, infos, groups, stats, ...(sender ? { sender } : {}), ...(probe ? { probe } : {}) })
+  stats.setGate(bot.gateStatus(initBlock))
+  const loop = new BlockLoop((block, skipped) => {
+    if (source) stats.setHead(source.status())
+    return bot.processBlock(block, skipped)
+  })
   const source = startHeadSource({
     subscriptions: wsSubscriptions(clients, cfg),
     poll: () => withRetry(() => clients.http.getBlockNumber({ cacheTime: 0 }), { label: 'eth_blockNumber', tries: 2 }),
@@ -82,6 +98,7 @@ async function main(): Promise<void> {
       if (summary) log.info({ hash: summary.hash, status: summary.status, block: summary.blockNumber, feePaid: summary.feePaid }, 'in-flight transaction settled')
       else log.warn(inFlight, 'in-flight transaction still unconfirmed at exit')
     }
+    if (monitor) await monitor.close().catch((error: unknown) => log.warn({ err: error }, 'monitor server did not close cleanly'))
     log.info({ lastBlock: loop.lastProcessed, inFlight: sender?.inFlight ?? null }, 'stopped')
     await exitAfterFlush(0)
   }
@@ -127,6 +144,14 @@ async function initCache(clients: RpcClients, cache: StateCache): Promise<bigint
     await cache.init(latest - 1n)
     return latest - 1n
   }
+}
+
+/** Start the live monitor when `MONITOR_PORT` is set; `undefined` when it is 0. */
+async function startMonitor(cfg: Config, stats: BotStats): Promise<MonitorServer | undefined> {
+  if (cfg.MONITOR_PORT <= 0) return undefined
+  const monitor = await startMonitorServer(stats, { port: cfg.MONITOR_PORT, host: cfg.MONITOR_HOST })
+  log.info({ url: monitor.url, status: `${monitor.url}/api/status`, metrics: `${monitor.url}/metrics` }, 'live monitor listening')
+  return monitor
 }
 
 function makeSender(clients: RpcClients, cfg: Config): Sender {
