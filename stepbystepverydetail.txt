@@ -261,6 +261,24 @@ You need TWO brand-new wallets. Never reuse a wallet that holds other funds.
 
     Each prints an Address and a Private key.
 
+8.1b  Already have a private key? Get its address
+
+    An address is derived from a private key. If you already know a key:
+
+    cast wallet address --private-key 0xYOUR_PRIVATE_KEY
+        -> prints the 0x... address (this is "0xYourOwnerAddress" if you use
+           that key as the owner)
+
+    If the key is in MetaMask / Rabby, the address is the one shown at the top
+    of the wallet (the one you receive funds on).
+
+    You still need a SECOND key for the operator: run "cast wallet new" once
+    and use its address as 0xYourOperatorAddress and its private key as
+    PRIVATE_KEY in .env. Do not use the same key for both roles.
+
+    EXECUTOR_ADDRESS does not exist yet: it is printed by the deployment in
+    Part 10 ("ArcArbExecutor deployed at 0x..."). Leave it empty until then.
+
 8.2  Store them
 
     - OWNER private key: write it down / password manager. It will hold the
